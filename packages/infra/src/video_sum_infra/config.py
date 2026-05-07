@@ -106,6 +106,7 @@ class ServiceSettings(BaseSettings):
     summary_chunk_overlap_segments: int = 2
     summary_chunk_concurrency: int = 2
     summary_chunk_retry_count: int = 2
+    enable_key_frames: bool = True
 
     model_config = SettingsConfigDict(
         env_prefix="VIDEO_SUM_",

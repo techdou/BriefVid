@@ -20,7 +20,7 @@ from video_sum_core.errors import (
     UnsupportedInputError,
     VideoSumError,
 )
-from video_sum_core.models.tasks import InputType, TaskResult
+from video_sum_core.models.tasks import InputType, KeyFrame, TaskResult
 from video_sum_core.pipeline.base import PipelineContext, PipelineEvent, PipelineEventReporter, PipelineRunner
 from video_sum_core.utils import ensure_directory, normalize_video_url, sanitize_filename
 from video_sum_infra.runtime import (
@@ -143,6 +143,7 @@ class PipelineSettings:
     summary_chunk_overlap_segments: int = 2
     summary_chunk_concurrency: int = 2
     summary_chunk_retry_count: int = 2
+    enable_key_frames: bool = True
 
 
 class RealPipelineRunner(PipelineRunner):
@@ -194,8 +195,11 @@ class RealPipelineRunner(PipelineRunner):
         audio_path = self._download_audio(normalized_url, task_dir, safe_title, emit)
         transcript, segments = self._transcribe(audio_path, metadata.get("duration"), emit)
         summary = self._summarize(transcript, segments, title, emit)
+        key_frames = self._extract_key_frames_if_enabled(
+            normalized_url, task_dir, summary.get("chapters", []), emit
+        )
         emit("exporting", 97, "正在导出任务结果")
-        result = self._export_result(task_dir, title, transcript, segments, summary)
+        result = self._export_result(task_dir, title, transcript, segments, summary, key_frames)
         emit("exporting", 99, "结果文件已写入本地目录")
         logger.info(
             "pipeline run finish task_id=%s segments=%d transcript_chars=%d output_dir=%s",
@@ -1308,6 +1312,177 @@ class RealPipelineRunner(PipelineRunner):
                 break
         return chapters
 
+    def _extract_key_frames_if_enabled(
+        self,
+        url: str,
+        task_dir: Path,
+        chapters: list[dict[str, object]],
+        emit: Callable[[str, int, str, dict[str, object] | None], None],
+    ) -> list[KeyFrame]:
+        if not self._settings.enable_key_frames:
+            return []
+        try:
+            return self._extract_key_frames(url, task_dir, chapters, emit)
+        except Exception:
+            logger.warning("key frame extraction failed, continuing without frames", exc_info=True)
+            return []
+
+    def _extract_key_frames(
+        self,
+        url: str,
+        task_dir: Path,
+        chapters: list[dict[str, object]],
+        emit: Callable[[str, int, str, dict[str, object] | None], None],
+    ) -> list[KeyFrame]:
+        if not chapters:
+            return []
+
+        emit("extracting_frames", 95, "正在提取关键帧截图")
+        frames_dir = ensure_directory(task_dir / "frames")
+
+        video_url = self._resolve_video_stream_url(url)
+        if not video_url:
+            logger.warning("key frame extraction skipped: could not resolve video stream url")
+            return []
+
+        key_frames: list[KeyFrame] = []
+        total_chapters = len(chapters)
+
+        for index, chapter in enumerate(chapters):
+            start = float(chapter.get("start") or 0)
+            chapter_title = str(chapter.get("title") or f"章节 {index + 1}")
+            frame_filename = f"frame_{index:03d}_{int(start)}.jpg"
+            frame_path = frames_dir / frame_filename
+
+            if frame_path.exists():
+                key_frames.append(
+                    KeyFrame(
+                        timestamp=start,
+                        path=f"frames/{frame_filename}",
+                        chapter_title=chapter_title,
+                    )
+                )
+                continue
+
+            success = self._capture_frame_at(video_url, start, frame_path)
+            if success:
+                key_frames.append(
+                    KeyFrame(
+                        timestamp=start,
+                        path=f"frames/{frame_filename}",
+                        chapter_title=chapter_title,
+                    )
+                )
+                emit(
+                    "extracting_frames",
+                    95,
+                    f"已提取第 {index + 1}/{total_chapters} 个关键帧",
+                    {"chapter": chapter_title, "timestamp": start},
+                )
+            else:
+                logger.warning(
+                    "key frame capture failed chapter=%s timestamp=%.1f",
+                    chapter_title,
+                    start,
+                )
+
+        logger.info(
+            "key frame extraction finished total_chapters=%d captured_frames=%d",
+            total_chapters,
+            len(key_frames),
+        )
+        return key_frames
+
+    def _resolve_video_stream_url(self, url: str) -> str | None:
+        try:
+            with YoutubeDL(
+                {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "noplaylist": True,
+                }
+            ) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if not isinstance(info, dict):
+                return None
+            direct_url = info.get("url")
+            if direct_url and isinstance(direct_url, str) and direct_url.startswith("http"):
+                return direct_url
+            formats = info.get("formats") or []
+            for fmt in reversed(formats):
+                if not isinstance(fmt, dict):
+                    continue
+                fmt_url = fmt.get("url")
+                if fmt_url and isinstance(fmt_url, str) and fmt_url.startswith("http"):
+                    return fmt_url
+            return None
+        except Exception:
+            logger.warning("failed to resolve video stream url", exc_info=True)
+            return None
+
+    def _capture_frame_at(self, video_url: str, timestamp: float, output_path: Path) -> bool:
+        ffmpeg_exe = ffmpeg_location()
+        ffmpeg_cmd = str(ffmpeg_exe) if ffmpeg_exe else "ffmpeg"
+
+        command = [
+            ffmpeg_cmd,
+            "-y",
+            "-ss",
+            str(timestamp),
+            "-i",
+            video_url,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            "-an",
+            "-sn",
+            str(output_path),
+        ]
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        runtime_paths = [str(path) for path in runtime_library_dirs(self._settings.runtime_channel)]
+        if ffmpeg_exe is not None:
+            runtime_paths.append(str(ffmpeg_exe))
+        env["VIDEO_SUM_DLL_PATHS"] = os.pathsep.join(runtime_paths)
+        merged_path: list[str] = []
+        for entry in [*runtime_paths, *(env.get("PATH", "").split(os.pathsep))]:
+            item = entry.strip()
+            if item and item not in merged_path:
+                merged_path.append(item)
+        env["PATH"] = os.pathsep.join(merged_path)
+
+        try:
+            with sanitized_subprocess_dll_search():
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    env=env,
+                    **_windows_hidden_subprocess_kwargs(),
+                )
+            if result.returncode != 0:
+                logger.warning(
+                    "ffmpeg frame capture failed timestamp=%.1f returncode=%d stderr=%s",
+                    timestamp,
+                    result.returncode,
+                    (result.stderr or "").strip()[:500],
+                )
+                return False
+            return output_path.exists() and output_path.stat().st_size > 0
+        except subprocess.TimeoutExpired:
+            logger.warning("ffmpeg frame capture timed out timestamp=%.1f", timestamp)
+            return False
+        except Exception:
+            logger.warning("ffmpeg frame capture error timestamp=%.1f", timestamp, exc_info=True)
+            return False
+
     def _export_result(
         self,
         task_dir: Path,
@@ -1315,6 +1490,7 @@ class RealPipelineRunner(PipelineRunner):
         transcript: str,
         segments: list[dict[str, object]],
         summary: dict[str, object],
+        key_frames: list[KeyFrame] | None = None,
     ) -> TaskResult:
         transcript_path = task_dir / "transcript.txt"
         summary_path = task_dir / "summary.json"
@@ -1324,9 +1500,10 @@ class RealPipelineRunner(PipelineRunner):
             encoding="utf-8",
         )
         logger.info(
-            "result exported transcript_path=%s summary_path=%s",
+            "result exported transcript_path=%s summary_path=%s key_frames=%d",
             transcript_path,
             summary_path,
+            len(key_frames or []),
         )
         return TaskResult(
             overview=str(summary.get("overview") or ""),
@@ -1341,6 +1518,7 @@ class RealPipelineRunner(PipelineRunner):
                 }
                 for item in summary.get("chapters", [])
             ],
+            key_frames=key_frames or [],
             artifacts={
                 "transcript_path": str(transcript_path),
                 "summary_path": str(summary_path),

@@ -46,6 +46,7 @@ class SettingsUpdatePayload(BaseModel):
     summary_chunk_overlap_segments: int | None = None
     summary_chunk_concurrency: int | None = None
     summary_chunk_retry_count: int | None = None
+    enable_key_frames: bool | None = None
 
 
 class SettingsManager:

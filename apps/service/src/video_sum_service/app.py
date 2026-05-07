@@ -418,6 +418,7 @@ def build_worker(repository: SqliteTaskRepository, current_settings: ServiceSett
         summary_chunk_overlap_segments=runtime_settings.summary_chunk_overlap_segments,
         summary_chunk_concurrency=runtime_settings.summary_chunk_concurrency,
         summary_chunk_retry_count=runtime_settings.summary_chunk_retry_count,
+        enable_key_frames=runtime_settings.enable_key_frames,
     )
     return TaskWorker(repository=repository, pipeline_runner=RealPipelineRunner(pipeline_settings))
 
@@ -459,6 +460,7 @@ def serialize_settings(current_settings: ServiceSettings) -> dict[str, object]:
         "summary_chunk_overlap_segments": current_settings.summary_chunk_overlap_segments,
         "summary_chunk_concurrency": current_settings.summary_chunk_concurrency,
         "summary_chunk_retry_count": current_settings.summary_chunk_retry_count,
+        "enable_key_frames": current_settings.enable_key_frames,
     }
 
 
@@ -934,3 +936,18 @@ def get_task_progress(task_id: str) -> TaskProgressResponse:
         latest_message=latest_event.message if latest_event is not None else None,
         updated_at=record.updated_at,
     )
+
+
+@app.get("/api/v1/tasks/{task_id}/frames/{frame_path:path}")
+def get_task_frame(task_id: str, frame_path: str) -> FileResponse:
+    task_store: SqliteTaskRepository = app.state.task_repository
+    record = task_store.get_task(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    safe_name = Path(frame_path).name
+    if not safe_name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        raise HTTPException(status_code=400, detail="Unsupported image format.")
+    frame_file = settings.tasks_dir / task_id / "frames" / safe_name
+    if not frame_file.is_file():
+        raise HTTPException(status_code=404, detail="Frame not found.")
+    return FileResponse(str(frame_file), media_type="image/jpeg")

@@ -450,9 +450,13 @@ function renderResultPanels(result) {
           <span class="result-count">${result.timeline?.length || 0} 段</span>
         </div>
         <div class="timeline ${result.timeline?.length ? "" : "empty-state"}">
-          ${result.timeline?.length ? result.timeline.map((item, index) => `
+          ${result.timeline?.length ? result.timeline.map((item, index) => {
+            const keyFrame = result.key_frames?.find(f => Math.abs(f.timestamp - (item.start ?? 0)) < 1);
+            const frameSrc = keyFrame && state.selectedTaskId ? `/api/v1/tasks/${state.selectedTaskId}/${keyFrame.path}` : null;
+            return `
             <article class="timeline-item">
               <div class="timeline-marker" aria-hidden="true">${index + 1}</div>
+              ${frameSrc ? `<div class="timeline-frame"><img src="${frameSrc}" alt="${escapeHtml(keyFrame?.chapter_title || item.title || "章节截图")}" loading="lazy" /></div>` : ""}
               <div class="timeline-content">
                 <h4>${escapeHtml(item.title || "章节")}</h4>
                 <div class="timeline-meta">
@@ -461,7 +465,7 @@ function renderResultPanels(result) {
                 <p>${escapeHtml(item.summary || "")}</p>
               </div>
             </article>
-          `).join("") : `<div class="empty-placeholder">暂无时间轴</div>`}
+          `}).join("") : `<div class="empty-placeholder">暂无时间轴</div>`}
         </div>
       </section>
       <section class="grid-card transcript-card">

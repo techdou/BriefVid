@@ -6,11 +6,18 @@ export type TimelineItem = {
   summary?: string;
 };
 
+export type KeyFrame = {
+  timestamp: number;
+  path: string;
+  chapter_title: string;
+};
+
 export type TaskResult = {
   overview: string;
   transcript_text: string;
   key_points: string[];
   timeline: TimelineItem[];
+  key_frames: KeyFrame[];
   llm_total_tokens?: number | null;
 };
 
@@ -114,6 +121,7 @@ export type ServiceSettings = {
   summary_chunk_overlap_segments: number;
   summary_chunk_concurrency: number;
   summary_chunk_retry_count: number;
+  enable_key_frames: boolean;
 };
 
 export type SystemInfo = {

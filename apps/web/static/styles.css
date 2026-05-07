@@ -989,6 +989,25 @@ body {
   transition: all 0.15s ease;
 }
 
+.timeline-item:has(.timeline-frame) {
+  grid-template-columns: auto 200px 1fr;
+}
+
+.timeline-frame {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-soft);
+}
+
+.timeline-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
 .timeline-item:hover {
   border-color: var(--border-default);
   transform: translateX(4px);

@@ -2203,6 +2203,25 @@ textarea {
   align-items: start;
 }
 
+.timeline-item-simple:has(.timeline-frame) {
+  grid-template-columns: 80px 200px 1fr;
+}
+
+.timeline-frame {
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-soft);
+}
+
+.timeline-frame img {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
 .timeline-time-badge {
   display: inline-flex;
   align-items: center;

@@ -878,15 +878,28 @@ function VideoDetailPage({ onRefresh }: { onRefresh(): void }) {
                 <section className="result-section">
                   <h3 className="result-section-title">时间轴</h3>
                   <div className="timeline-list">
-                    {video.latest_result.timeline.map((item, index) => (
-                      <article className="timeline-item-simple" key={`${item.title}-${index}`}>
-                        <div className="timeline-time-badge">{formatDuration(item.start ?? 0)}</div>
-                        <div className="timeline-content-simple">
-                          <h4>{item.title || "章节"}</h4>
-                          <p>{item.summary || ""}</p>
-                        </div>
-                      </article>
-                    ))}
+                    {video.latest_result.timeline.map((item, index) => {
+                      const keyFrame = video.latest_result?.key_frames?.find(
+                        (frame) => Math.abs(frame.timestamp - (item.start ?? 0)) < 1
+                      );
+                      const frameSrc = keyFrame && selectedTask?.task_id
+                        ? `/api/v1/tasks/${selectedTask.task_id}/${keyFrame.path}`
+                        : null;
+                      return (
+                        <article className="timeline-item-simple" key={`${item.title}-${index}`}>
+                          <div className="timeline-time-badge">{formatDuration(item.start ?? 0)}</div>
+                          {frameSrc && (
+                            <div className="timeline-frame">
+                              <img src={frameSrc} alt={keyFrame?.chapter_title || item.title || "章节截图"} loading="lazy" />
+                            </div>
+                          )}
+                          <div className="timeline-content-simple">
+                            <h4>{item.title || "章节"}</h4>
+                            <p>{item.summary || ""}</p>
+                          </div>
+                        </article>
+                      );
+                    })}
                   </div>
                 </section>
                 <section className="result-section transcript-section">
@@ -1706,6 +1719,14 @@ function SettingsPage({
                   <span className="settings-input-label">重试次数</span>
                   <input className="settings-input-field" type="number" value={form.summary_chunk_retry_count} onChange={(e) => setForm({ ...form, summary_chunk_retry_count: parseInt(e.target.value) || 2 })} />
                   <span className="settings-input-caption">API 调用失败时的重试次数</span>
+                </label>
+                <label className="settings-input-group">
+                  <span className="settings-input-label">关键帧截图</span>
+                  <select className="settings-select-field" value={form.enable_key_frames ? "true" : "false"} onChange={(e) => setForm({ ...form, enable_key_frames: e.target.value === "true" })}>
+                    <option value="true">开启</option>
+                    <option value="false">关闭</option>
+                  </select>
+                  <span className="settings-input-caption">自动在章节时间点提取视频关键帧截图，展示在时间轴旁</span>
                 </label>
               </div>
             </section>
