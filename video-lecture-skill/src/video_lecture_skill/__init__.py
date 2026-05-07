@@ -1,0 +1,15 @@
+from video_lecture_skill.models import (
+    LectureNote,
+    LectureSection,
+    MindmapNode,
+    MindmapResult,
+    PipelineEvent,
+    PipelineResult,
+    Segment,
+    TaskInput,
+    TaskOutputFormat,
+    TaskRecord,
+    TaskStatus,
+    TranscriptionResult,
+    VideoInfo,
+)

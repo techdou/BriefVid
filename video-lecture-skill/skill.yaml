@@ -1,0 +1,27 @@
+name: video-lecture
+version: 0.1.0
+description: |
+  视频转讲义与思维导图 Skill。
+  输入视频链接，自动完成下载、转码、语音转文字、
+  生成结构化讲义（Markdown）和思维导图（Mermaid）。
+  支持 B站/YouTube/抖音 等多平台，支持本地 Whisper 和云 API 双模式转写。
+author: community
+tags:
+  - video
+  - lecture
+  - mindmap
+  - transcription
+  - whisper
+  - llm
+entry_point: video_lecture_skill.api:app
+cli_entry: video_lecture_skill.cli:main
+config_prefix: VLEC_
+requires:
+  - ffmpeg
+  - python>=3.11
+capabilities:
+  - video_download
+  - audio_transcription
+  - lecture_generation
+  - mindmap_generation
+  - multi_format_export
