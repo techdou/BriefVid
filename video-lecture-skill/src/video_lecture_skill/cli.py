@@ -6,9 +6,8 @@ import sys
 from pathlib import Path
 
 from video_lecture_skill.config import SkillSettings
-from video_lecture_skill.export import export_to_files
-from video_lecture_skill.models import TaskInput, TaskOutputFormat, TranscribeMode
-from video_lecture_skill.pipeline import run_pipeline
+from video_lecture_skill.models import TranscribeMode
+from video_lecture_skill.service import VideoLectureService
 
 
 def main() -> int:
@@ -20,6 +19,11 @@ def main() -> int:
   video-lecture https://www.bilibili.com/video/BV1R6NFzXE1H/
   video-lecture https://www.youtube.com/watch?v=dQw4w9WgXcQ --title "视频标题"
   video-lecture https://www.bilibili.com/video/BV1R6NFzXE1H/ --mode cloud --output ./output
+
+Agent 调用示例:
+  from video_lecture_skill import VideoLectureService
+  service = VideoLectureService()
+  result = service.process(url="https://...", title="标题")
         """,
     )
     parser.add_argument("url", help="视频链接（支持B站、YouTube、抖音等）")
@@ -41,7 +45,6 @@ def main() -> int:
     )
 
     settings = SkillSettings()
-    settings.ensure_dirs()
 
     if args.api_key:
         settings = settings.model_copy(update={"openai_api_key": args.api_key})
@@ -49,6 +52,8 @@ def main() -> int:
         settings = settings.model_copy(update={"openai_base_url": args.base_url})
     if args.model:
         settings = settings.model_copy(update={"openai_model": args.model})
+    if args.mode == "cloud":
+        settings = settings.model_copy(update={"transcribe_mode": TranscribeMode.CLOUD})
 
     if args.serve:
         return _serve(settings)
@@ -61,19 +66,10 @@ def _process(args: argparse.Namespace, settings: SkillSettings) -> int:
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
     console = Console()
-    console.print(f"[bold blue]🎬 Video Lecture Skill[/bold blue]")
+    console.print("[bold blue]🎬 Video Lecture Skill[/bold blue]")
     console.print(f"视频链接: {args.url}")
 
-    transcribe_mode = TranscribeMode.CLOUD if args.mode == "cloud" else settings.transcribe_mode
-
-    task_input = TaskInput(
-        url=args.url,
-        title=args.title,
-        language=args.language,
-        transcribe_mode=transcribe_mode,
-    )
-
-    output_dir = Path(args.output) if args.output else None
+    service = VideoLectureService(settings)
 
     with Progress(
         SpinnerColumn(),
@@ -84,36 +80,35 @@ def _process(args: argparse.Namespace, settings: SkillSettings) -> int:
     ) as progress:
         task = progress.add_task("处理中...", total=100)
 
-        def on_event(event):
-            progress.update(task, completed=event.progress, description=f"[{event.stage}] {event.message}")
-
         try:
-            result = run_pipeline(task_input=task_input, settings=settings, emit=on_event)
+            result = service.process_and_wait(
+                url=args.url,
+                title=args.title,
+                language=args.language,
+                output_dir=args.output,
+            )
         except Exception as exc:
             console.print(f"[bold red]❌ 处理失败: {exc}[/bold red]")
             return 1
 
-    if output_dir:
-        artifacts = export_to_files(result, output_dir)
+    if result["success"]:
+        console.print("\n[bold green]✅ 处理完成！[/bold green]")
+        console.print(f"  标题: {result['lecture_title']}")
+        console.print(f"  章节数: {result['sections_count']}")
+        console.print(f"  转写字数: {result['transcript_chars']}")
+
+        if result.get("artifacts"):
+            console.print("\n[bold]输出文件:[/bold]")
+            for key, path in result["artifacts"].items():
+                console.print(f"  {key}: {path}")
+        return 0
     else:
-        artifacts = result.artifacts
-
-    console.print("\n[bold green]✅ 处理完成！[/bold green]")
-    console.print(f"  标题: {result.lecture.title}")
-    console.print(f"  章节数: {len(result.lecture.sections)}")
-    console.print(f"  转写字数: {len(result.transcription.transcript)}")
-
-    if artifacts:
-        console.print("\n[bold]输出文件:[/bold]")
-        for key, path in artifacts.items():
-            console.print(f"  {key}: {path}")
-
-    return 0
+        console.print(f"\n[bold red]❌ 处理失败: {result.get('error', 'Unknown error')}[/bold red]")
+        return 1
 
 
 def _serve(settings: SkillSettings) -> int:
     import uvicorn
-
     from video_lecture_skill.api import app
 
     logging.info("starting api server host=%s port=%s", settings.host, settings.port)
