@@ -1337,16 +1337,17 @@ class RealPipelineRunner(PipelineRunner):
         if not chapters:
             return []
 
-        emit("extracting_frames", 95, "正在提取关键帧截图")
         frames_dir = ensure_directory(task_dir / "frames")
 
         video_url = self._resolve_video_stream_url(url)
         if not video_url:
+            emit("extracting_frames", 95, "无法获取视频流，跳过关键帧提取")
             logger.warning("key frame extraction skipped: could not resolve video stream url")
             return []
 
         key_frames: list[KeyFrame] = []
         total_chapters = len(chapters)
+        emit("extracting_frames", 95, f"开始提取 {total_chapters} 个关键帧")
 
         for index, chapter in enumerate(chapters):
             start = float(chapter.get("start") or 0)
@@ -1373,11 +1374,11 @@ class RealPipelineRunner(PipelineRunner):
                         chapter_title=chapter_title,
                     )
                 )
-                emit(
-                    "extracting_frames",
-                    95,
-                    f"已提取第 {index + 1}/{total_chapters} 个关键帧",
-                    {"chapter": chapter_title, "timestamp": start},
+                logger.debug(
+                    "key frame captured chapter=%s timestamp=%.1f path=%s",
+                    chapter_title,
+                    start,
+                    frame_path,
                 )
             else:
                 logger.warning(
@@ -1386,6 +1387,12 @@ class RealPipelineRunner(PipelineRunner):
                     start,
                 )
 
+        emit(
+            "extracting_frames",
+            96,
+            f"关键帧提取完成，已获取 {len(key_frames)}/{total_chapters} 张截图",
+            {"captured": len(key_frames), "total": total_chapters},
+        )
         logger.info(
             "key frame extraction finished total_chapters=%d captured_frames=%d",
             total_chapters,

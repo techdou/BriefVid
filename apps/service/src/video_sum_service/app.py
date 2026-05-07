@@ -947,7 +947,9 @@ def get_task_frame(task_id: str, frame_path: str) -> FileResponse:
     safe_name = Path(frame_path).name
     if not safe_name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
         raise HTTPException(status_code=400, detail="Unsupported image format.")
-    frame_file = settings.tasks_dir / task_id / "frames" / safe_name
-    if not frame_file.is_file():
+    frame_file = (settings.tasks_dir / task_id / "frames" / safe_name).resolve()
+    allowed_root = (settings.tasks_dir / task_id / "frames").resolve()
+    if not str(frame_file).startswith(str(allowed_root)) or not frame_file.is_file():
         raise HTTPException(status_code=404, detail="Frame not found.")
-    return FileResponse(str(frame_file), media_type="image/jpeg")
+    media_type = "image/jpeg" if frame_file.suffix.lower() in (".jpg", ".jpeg") else "image/png" if frame_file.suffix.lower() == ".png" else "image/webp"
+    return FileResponse(str(frame_file), media_type=media_type)
