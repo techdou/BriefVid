@@ -20,14 +20,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mcp = [
+    "mcp>=1.20",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
+    "mcp>=1.20",
 ]
 
 [project.scripts]
 video-lecture = "video_lecture_skill.cli:main"
+video-lecture-mcp = "mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/video_lecture_skill"]
