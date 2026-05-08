@@ -1,27 +1,159 @@
 name: video-lecture
 version: 0.1.0
-description: |
-  视频转讲义与思维导图 Skill。
-  输入视频链接，自动完成下载、转码、语音转文字、
-  生成结构化讲义（Markdown）和思维导图（Mermaid）。
-  支持 B站/YouTube/抖音 等多平台，支持本地 Whisper 和云 API 双模式转写。
-author: community
+description:
+  short: "视频转讲义与思维导图 — 输入视频链接，自动生成 Markdown 讲义和 Mermaid 思维导图"
+  full: |
+    Video Lecture Skill 将视频内容自动转换为结构化课程讲义和可视化思维导图。
+    支持 B站、YouTube、抖音等多平台视频源，自动完成下载、转码、语音转写、LLM 生成讲义、生成思维导图的全流程。
+    适用于学习笔记整理、知识提炼、课程内容归档等场景。
+author:
+  name: community
+  email: ""
 tags:
-  - video
-  - lecture
+  - video-processing
+  - lecture-notes
   - mindmap
   - transcription
   - whisper
   - llm
+keywords:
+  - video
+  - lecture
+  - notes
+  - mindmap
+  - transcription
+  - summarization
+  - bilibili
+  - youtube
+  - agent
+  - skill
+homepage: ""
+license: MIT
+api_version: "v1"
 entry_point: video_lecture_skill.api:app
 cli_entry: video_lecture_skill.cli:main
 config_prefix: VLEC_
 requires:
-  - ffmpeg
-  - python>=3.11
+  runtime:
+    - fapt
+    - python>=3.11
+  tools:
+    - ffmpeg
 capabilities:
-  - video_download
-  - audio_transcription
-  - lecture_generation
-  - mindmap_generation
-  - multi_format_export
+  - id: video_download
+    description: 从 B站/YouTube/抖音 等平台下载视频并提取音频
+    platforms: [bilibili, youtube, douyin, generic]
+  - id: audio_transcription
+    description: 语音转文字，支持本地 Whisper 和云 API 双模式
+    modes: [local, cloud]
+  - id: lecture_generation
+    description: 基于转写内容生成结构化课程讲义（章节/概念/示例/思考题）
+    formats: [markdown, json]
+  - id: mindmap_generation
+    description: 生成 Mermaid 格式的层级思维导图
+    formats: [mermaid, json]
+  - id: multi_format_export
+    description: 多格式导出（Markdown/Mermaid/JSON/TXT）
+  - id: progress_tracking
+    description: 实时进度追踪，支持 SSE 流式推送
+  - id: error_recovery
+    description: 自动降级和优雅错误处理
+parameters:
+  url:
+    type: string
+    required: true
+    description: 视频链接（支持 B站BV号、B站链接、YouTube链接、抖音链接等）
+    examples:
+      - "https://www.bilibili.com/video/BV1R6NFzXE1H/"
+      - "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+      - "BV1R6NFzXE1H"
+  title:
+    type: string
+    required: false
+    description: 视频标题（可选，默认自动从视频元数据获取）
+  language:
+    type: string
+    required: false
+    default: "zh"
+    description: 转写语言代码
+    enum: [zh, en, ja, ko, auto]
+  output_formats:
+    type: array
+    required: false
+    default: [markdown, mermaid, json]
+    description: 输出格式列表
+    items:
+      type: string
+      enum: [markdown, mermaid, json]
+  transcribe_mode:
+    type: string
+    required: false
+    description: 转写模式
+    enum: [local, cloud]
+outputs:
+  lecture_md:
+    type: string
+    description: Markdown 格式的课程讲义
+    format: text/markdown
+  mindmap_mermaid:
+    type: string
+    description: Mermaid 格式的思维导图
+    format: text/plain
+  transcript:
+    type: string
+    description: 视频转写文本（带时间戳）
+    format: text/plain
+  result_json:
+    type: object
+    description: 完整结果 JSON（包含所有字段）
+  artifacts:
+    type: object
+    description: 输出文件路径映射
+events:
+  - stage: preparing
+    description: 规范化视频链接
+    progress: 0-5
+  - stage: downloading
+    description: 下载视频并提取音频
+    progress: 5-50
+  - stage: transcribing
+    description: 语音转文字
+    progress: 50-85
+  - stage: lecture
+    description: 生成课程讲义
+    progress: 85-95
+  - stage: mindmap
+    description: 生成思维导图
+    progress: 95-97
+  - stage: exporting
+    description: 导出结果文件
+    progress: 97-100
+  - stage: completed
+    description: 处理完成
+    progress: 100
+errors:
+  - code: DOWNLOAD_ERROR
+    message: 视频下载失败
+    recoverable: true
+  - code: TRANSCRIBE_ERROR
+    message: 语音转写失败
+    recoverable: true
+  - code: LLM_ERROR
+    message: LLM 生成失败（自动降级为规则生成）
+    recoverable: true
+  - code: UNSUPPORTED_PLATFORM
+    message: 不支持的视频平台
+    recoverable: false
+  - code: TIMEOUT
+    message: 处理超时
+    recoverable: true
+limits:
+  max_video_duration_seconds: 7200
+  max_transcript_chars: 500000
+  max_lecture_sections: 20
+  max_concurrent_tasks: 5
+metadata:
+  created_at: "2024-01-01"
+  updated_at: "2024-01-01"
+  stability: stable
+  breaking_changes: false
