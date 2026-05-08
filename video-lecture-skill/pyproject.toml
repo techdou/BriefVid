@@ -32,7 +32,9 @@ dev = [
 
 [project.scripts]
 video-lecture = "video_lecture_skill.cli:main"
-video-lecture-mcp = "mcp_server:main"
+
+[project.entry-points."mcp.servers"]
+video-lecture = "mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/video_lecture_skill"]

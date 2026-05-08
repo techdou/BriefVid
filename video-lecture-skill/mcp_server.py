@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import traceback
 from pathlib import Path
-from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -14,7 +12,6 @@ from video_lecture_skill import (
     VideoLectureService,
     format_error_for_user,
 )
-from video_lecture_skill.config import SkillSettings as _SkillSettings
 from video_lecture_skill.models import TranscribeMode
 
 logging.basicConfig(
@@ -54,10 +51,37 @@ def _get_service() -> VideoLectureService:
     return _service
 
 
+def _reset_service() -> None:
+    global _settings, _service
+    _service = None
+    _settings = None
+
+
+def _make_service_with_mode(transcribe_mode: TranscribeMode) -> VideoLectureService:
+    base = _get_service()
+    new_settings = base.settings.model_copy(update={"transcribe_mode": transcribe_mode})
+    return VideoLectureService(new_settings)
+
+
 def _truncate(value: str, max_len: int = 8000) -> str:
     if len(value) <= max_len:
         return value
     return value[:max_len] + f"\n...[已截断，原文共 {len(value)} 字]"
+
+
+def _resolve_transcribe_mode(mode_str: str | None) -> TranscribeMode | None:
+    if not mode_str:
+        return None
+    normalized = mode_str.strip().lower()
+    if normalized in ("cloud", "api", "openai"):
+        return TranscribeMode.CLOUD
+    if normalized == "local":
+        return TranscribeMode.LOCAL
+    return None
+
+
+async def _run_sync(fn):
+    return await asyncio.get_event_loop().run_in_executor(None, fn)
 
 
 @mcp.tool()
@@ -82,29 +106,14 @@ async def process_video(
         language: 转写语言代码，默认 zh，可选 en/ja/ko/auto
         transcribe_mode: 转写模式，可选 local(本地Whisper) 或 cloud(云API)，默认使用配置值
     """
-    service = _get_service()
-
-    effective_mode = None
-    if transcribe_mode:
-        normalized = transcribe_mode.strip().lower()
-        if normalized in ("cloud", "api", "openai"):
-            effective_mode = TranscribeMode.CLOUD
-        elif normalized == "local":
-            effective_mode = TranscribeMode.LOCAL
-
-    if effective_mode is not None:
-        settings = service.settings.model_copy(update={"transcribe_mode": effective_mode})
-        service = VideoLectureService(settings)
+    effective_mode = _resolve_transcribe_mode(transcribe_mode)
+    service = _make_service_with_mode(effective_mode) if effective_mode else _get_service()
 
     def _run():
-        return service.process_and_wait(
-            url=url,
-            title=title,
-            language=language,
-        )
+        return service.process_and_wait(url=url, title=title, language=language)
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        result = await _run_sync(_run)
     except Exception as exc:
         logger.exception("process_video failed: %s", exc)
         return json.dumps({
@@ -120,26 +129,17 @@ async def process_video(
             "task_id": result.get("task_id"),
         }, ensure_ascii=False, indent=2)
 
-    lecture_md = result.get("lecture_md", "")
-    mindmap_mermaid = result.get("mindmap_mermaid", "")
-    transcript = result.get("transcript", "")
-    sections_count = result.get("sections_count", 0)
-    lecture_title = result.get("lecture_title", "")
-    transcript_chars = result.get("transcript_chars", 0)
-
-    summary = {
+    return json.dumps({
         "success": True,
         "task_id": result.get("task_id"),
-        "lecture_title": lecture_title,
-        "sections_count": sections_count,
-        "transcript_chars": transcript_chars,
-        "lecture_md": _truncate(lecture_md, 12000),
-        "mindmap_mermaid": _truncate(mindmap_mermaid, 4000),
-        "transcript": _truncate(transcript, 6000),
+        "lecture_title": result.get("lecture_title", ""),
+        "sections_count": result.get("sections_count", 0),
+        "transcript_chars": result.get("transcript_chars", 0),
+        "lecture_md": _truncate(result.get("lecture_md", ""), 12000),
+        "mindmap_mermaid": _truncate(result.get("mindmap_mermaid", ""), 4000),
+        "transcript": _truncate(result.get("transcript", ""), 6000),
         "artifacts": result.get("artifacts", {}),
-    }
-
-    return json.dumps(summary, ensure_ascii=False, indent=2)
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -163,7 +163,7 @@ async def get_lecture_only(
         return service.process_and_wait(url=url, title=title, language=language)
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        result = await _run_sync(_run)
     except Exception as exc:
         return json.dumps({"success": False, "error": format_error_for_user(exc)}, ensure_ascii=False)
 
@@ -199,7 +199,7 @@ async def get_mindmap_only(
         return service.process_and_wait(url=url, title=title, language=language)
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        result = await _run_sync(_run)
     except Exception as exc:
         return json.dumps({"success": False, "error": format_error_for_user(exc)}, ensure_ascii=False)
 
@@ -237,15 +237,10 @@ async def save_results(
     service = _get_service()
 
     def _run():
-        return service.process_and_wait(
-            url=url,
-            title=title,
-            language=language,
-            output_dir=output_dir,
-        )
+        return service.process_and_wait(url=url, title=title, language=language, output_dir=output_dir)
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        result = await _run_sync(_run)
     except Exception as exc:
         return json.dumps({"success": False, "error": format_error_for_user(exc)}, ensure_ascii=False)
 
@@ -300,7 +295,7 @@ def get_config() -> str:
 @mcp.prompt()
 def video_lecture_prompt(url: str, title: str = "") -> str:
     """生成用于请求视频讲义整理的提示词模板。"""
-    parts = [f"请帮我将以下视频整理成结构化的课程讲义和思维导图。"]
+    parts = ["请帮我将以下视频整理成结构化的课程讲义和思维导图。"]
     parts.append(f"视频链接：{url}")
     if title:
         parts.append(f"视频标题：{title}")
