@@ -78,6 +78,7 @@ class VideoInfo(BaseModel):
                 "duration": {"type": "number", "example": 3600.0},
                 "thumbnail": {"type": "string", "format": "uri"},
                 "canonical_id": {"type": "string"},
+                "is_multi_page": {"type": "boolean"},
             },
         }
 
@@ -138,6 +139,9 @@ class LectureNote(BaseModel):
                 "sections": {"type": "array", "items": {"$ref": "#/components/schemas/LectureSection"}},
                 "summary": {"type": "string"},
                 "references": {"type": "array", "items": {"type": "string"}},
+                "llm_prompt_tokens": {"type": "integer", "nullable": True},
+                "llm_completion_tokens": {"type": "integer", "nullable": True},
+                "llm_total_tokens": {"type": "integer", "nullable": True},
             },
         }
 

@@ -7,7 +7,6 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 
 from video_lecture_skill.config import SkillSettings
 from video_lecture_skill.llm import chat_completion
@@ -112,6 +111,18 @@ class KnowledgeStore:
         self._video_results[video_id] = result
         if tags is not None:
             self._video_tags[video_id] = tags
+
+    def get_result(self, video_id: str) -> PipelineResult | None:
+        return self._video_results.get(video_id)
+
+    def get_indexed_chunk_count(self) -> int:
+        if self._collection is None:
+            return 0
+        try:
+            existing = self._collection.get()
+            return len(existing.get("ids", [])) if isinstance(existing, dict) else 0
+        except Exception:
+            return 0
 
     def _build_chunks_for_video(self, video_id: str) -> list[dict[str, object]]:
         result = self._video_results.get(video_id)
@@ -350,7 +361,7 @@ class KnowledgeAgent:
         for item in chunks:
             video_id = str(item["video_id"])
             metadata = item["metadata"] if isinstance(item["metadata"], dict) else {}
-            result = self._store._video_results.get(video_id)
+            result = self._store.get_result(video_id)
             video_title = (result.lecture.title or result.video_info.title) if result else "未知视频"
             anchor_seconds = float(metadata["anchor_seconds"]) if metadata.get("anchor_seconds") not in {None, "", -1, -1.0} else None
             timestamp = format_anchor_seconds(anchor_seconds)

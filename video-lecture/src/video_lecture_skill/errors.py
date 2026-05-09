@@ -1,3 +1,6 @@
+import httpx
+
+
 class VideoLectureError(Exception):
     pass
 
@@ -31,7 +34,6 @@ class TranscriptionTimeoutError(TranscribeError):
 
 
 def is_retryable_error(error: Exception) -> bool:
-    import httpx
     if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
         return True
     if isinstance(error, TranscribeError) and "timeout" in str(error).lower():

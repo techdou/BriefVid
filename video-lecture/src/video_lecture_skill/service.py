@@ -32,8 +32,10 @@ from video_lecture_skill.models import (
     KnowledgeStatsResponse,
     PipelineEvent,
     PipelineResult,
+    Segment,
     TaskInput,
     TagItem,
+    TranscriptionResult,
     VideoTagRecord,
 )
 from video_lecture_skill.mindmap import generate_mindmap
@@ -44,6 +46,8 @@ logger = logging.getLogger("video_lecture_skill.service")
 
 
 class VideoLectureService:
+    MAX_TASK_RESULTS = 200
+
     def __init__(self, settings: SkillSettings | None = None):
         self.settings = settings or SkillSettings()
         self.settings.ensure_dirs()
@@ -83,7 +87,6 @@ class VideoLectureService:
         logger.info("process start task_id=%s url=%s page=%s", task_id, url, page_number)
 
         events: list[PipelineEvent] = []
-        last_result: PipelineResult | None = None
 
         def on_event(event: PipelineEvent) -> None:
             events.append(event)
@@ -102,10 +105,10 @@ class VideoLectureService:
                 settings=self.settings,
                 emit=on_event,
             )
-            last_result = result
 
             video_id = result.video_info.canonical_id or result.video_info.id
             self._task_results[task_id] = result
+            self._evict_old_tasks()
 
             if self.settings.knowledge_enabled:
                 self.knowledge_store.register_result(video_id, result)
@@ -266,7 +269,6 @@ class VideoLectureService:
             set(result.lecture.title or result.video_info.title for _, result in source_results)
         ) + "｜合集总结"
 
-        from video_lecture_skill.models import Segment, TranscriptionResult
         aggregate_transcription = TranscriptionResult(
             transcript="\n\n".join(transcript_parts),
             segments=[Segment(start=s["start"], end=s["end"], text=str(s["text"])) for s in segments],
@@ -406,9 +408,9 @@ class VideoLectureService:
     def get_knowledge_stats(self) -> KnowledgeStatsResponse:
         indexed_chunk_count = 0
         try:
-            if self._knowledge_store is not None and self._knowledge_store._collection is not None:
-                existing = self._knowledge_store._collection.get()
-                indexed_chunk_count = len(existing.get("ids", [])) if isinstance(existing, dict) else 0
+            if self._knowledge_store is not None:
+                chunk_count = self._knowledge_store.get_indexed_chunk_count()
+                indexed_chunk_count = chunk_count
         except Exception:
             pass
 
@@ -467,7 +469,8 @@ class VideoLectureService:
                     max_frames=max_frames,
                 )
 
-            existing.keyframes = keyframes
+            updated = existing.model_copy(update={"keyframes": keyframes})
+            self._task_results[task_id] = updated
 
             return {
                 "success": True,
@@ -478,6 +481,13 @@ class VideoLectureService:
         except Exception as exc:
             logger.exception("extract_keyframes failed task_id=%s error=%s", task_id, exc)
             return {"success": False, "error": format_error_for_user(exc)}
+
+    def _evict_old_tasks(self) -> None:
+        if len(self._task_results) <= self.MAX_TASK_RESULTS:
+            return
+        oldest_keys = list(self._task_results.keys())[: len(self._task_results) - self.MAX_TASK_RESULTS]
+        for key in oldest_keys:
+            self._task_results.pop(key, None)
 
     def get_capabilities(self) -> dict:
         return {
