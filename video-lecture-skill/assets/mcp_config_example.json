@@ -8,7 +8,9 @@
         "VLEC_OPENAI_BASE_URL": "https://api.openai.com/v1",
         "VLEC_OPENAI_MODEL": "gpt-4o-mini",
         "VLEC_TRANSCRIBE_MODE": "local",
-        "VLEC_WHISPER_MODEL": "base"
+        "VLEC_WHISPER_MODEL": "base",
+        "VLEC_KNOWLEDGE_ENABLED": "false",
+        "VLEC_OBSIDIAN_OUTPUT_DIR": ""
       }
     }
   }

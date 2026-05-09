@@ -39,13 +39,16 @@ mcp = FastMCP(
         "8. auto_tag: LLM 自动打标签\n"
         "9. get_tag_network: 获取标签共现网络\n"
         "10. get_knowledge_stats: 知识库统计信息\n"
-        "11. get_capabilities: 查询支持的平台和功能\n\n"
+        "11. setup_check: 首次使用环境检查\n"
+        "12. get_capabilities: 查询支持的平台和功能\n\n"
+        "首次使用建议先调用 setup_check 确认环境就绪。\n\n"
         "注意事项：\n"
         "- 首次使用本地转写模式会下载 Whisper 模型文件\n"
         "- 需要配置 VLEC_OPENAI_API_KEY 才能使用 LLM 生成高质量讲义\n"
         "- 知识库功能需设置 VLEC_KNOWLEDGE_ENABLED=true 并安装 chromadb + sentence-transformers\n"
         "- Obsidian 导出需设置 VLEC_OBSIDIAN_OUTPUT_DIR 或调用时指定 output_dir\n"
-        "- LLM 不可用时会自动降级为本地规则生成"
+        "- LLM 不可用时会自动降级为本地规则生成\n\n"
+        "详细文档见 references/ 目录：REFERENCE.md（技术参考）、CAPABILITIES.md（能力矩阵）、CONFIGURATION.md（配置指南）"
     ),
 )
 
@@ -531,6 +534,77 @@ async def save_results(
         "lecture_title": result.get("lecture_title"),
         "sections_count": result.get("sections_count"),
         "saved_files": result.get("artifacts", {}),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def setup_check() -> str:
+    """首次使用环境检查，验证所有必需和可选依赖是否就绪。
+
+    返回每个依赖项的状态（✅ 就绪 / ❌ 缺失 / ⚠️ 可选未安装）。
+    建议在首次使用 video-lecture-skill 前调用此工具确认环境。
+    """
+    import shutil
+    import sys
+
+    checks: list[dict[str, str]] = []
+
+    major, minor = sys.version_info[:2]
+    checks.append({
+        "name": "Python >= 3.11",
+        "status": "ok" if major >= 3 and minor >= 11 else "missing",
+        "detail": f"Python {major}.{minor}",
+        "required": "true",
+    })
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    checks.append({
+        "name": "ffmpeg",
+        "status": "ok" if ffmpeg_path else "missing",
+        "detail": f"found at {ffmpeg_path}" if ffmpeg_path else "not found",
+        "required": "true",
+    })
+
+    try:
+        import yt_dlp
+        checks.append({"name": "yt-dlp", "status": "ok", "detail": "installed", "required": "true"})
+    except ImportError:
+        checks.append({"name": "yt-dlp", "status": "missing", "detail": "pip install yt-dlp", "required": "true"})
+
+    try:
+        import faster_whisper
+        checks.append({"name": "faster-whisper", "status": "ok", "detail": "installed", "required": "true"})
+    except ImportError:
+        checks.append({"name": "faster-whisper", "status": "missing", "detail": "pip install faster-whisper", "required": "true"})
+
+    import os
+    api_key = os.environ.get("VLEC_OPENAI_API_KEY", "")
+    checks.append({
+        "name": "VLEC_OPENAI_API_KEY",
+        "status": "ok" if api_key else "missing",
+        "detail": "set" if api_key else "not set — export VLEC_OPENAI_API_KEY=sk-...",
+        "required": "true",
+    })
+
+    try:
+        import chromadb
+        checks.append({"name": "chromadb", "status": "ok", "detail": "installed", "required": "false"})
+    except ImportError:
+        checks.append({"name": "chromadb", "status": "optional", "detail": "pip install chromadb (for knowledge base)", "required": "false"})
+
+    try:
+        import sentence_transformers
+        checks.append({"name": "sentence-transformers", "status": "ok", "detail": "installed", "required": "false"})
+    except ImportError:
+        checks.append({"name": "sentence-transformers", "status": "optional", "detail": "pip install sentence-transformers (for knowledge base)", "required": "false"})
+
+    all_required_ok = all(c["status"] == "ok" for c in checks if c["required"] == "true")
+
+    return json.dumps({
+        "success": True,
+        "all_required_ok": all_required_ok,
+        "checks": checks,
+        "recommendation": "All required dependencies ready." if all_required_ok else "Some required dependencies are missing. Please install them.",
     }, ensure_ascii=False, indent=2)
 
 
