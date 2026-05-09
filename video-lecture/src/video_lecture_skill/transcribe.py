@@ -11,7 +11,7 @@ from typing import Callable
 
 import httpx
 
-from video_lecture_skill.models import PipelineEvent, Segment, TranscriptionResult, TranscribeMode
+from video_lecture_skill.models import PipelineEvent, Segment, TranscriptionResult, TranscribeMode, format_timestamp
 
 logger = logging.getLogger("video_lecture_skill.transcribe")
 
@@ -69,7 +69,7 @@ def _transcribe_local(
     for segment in raw_segments:
         seg = Segment(start=round(segment.start, 3), end=round(segment.end, 3), text=segment.text.strip())
         segments.append(seg)
-        transcript_lines.append(f"[{_format_timestamp(seg.start)}] {seg.text}")
+        transcript_lines.append(f"[{format_timestamp(seg.start)}] {seg.text}")
 
         if duration and duration > 0:
             progress = min(82, 56 + int((seg.end / duration) * 24))
@@ -129,7 +129,7 @@ def _transcribe_cloud(
     for seg in result.get("segments", []):
         s = Segment(start=seg.get("start", 0), end=seg.get("end", 0), text=seg.get("text", "").strip())
         segments.append(s)
-        transcript_lines.append(f"[{_format_timestamp(s.start)}] {s.text}")
+        transcript_lines.append(f"[{format_timestamp(s.start)}] {s.text}")
 
     transcript = result.get("text", "\n".join(transcript_lines))
     if not transcript.strip():
@@ -143,11 +143,3 @@ def _transcribe_cloud(
     )
 
 
-def _format_timestamp(seconds: float) -> str:
-    total = max(0, int(seconds))
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    secs = total % 60
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"

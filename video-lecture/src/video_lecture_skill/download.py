@@ -162,6 +162,46 @@ def download_audio(
     return candidates[0], video_info
 
 
+def download_video(
+    url: str,
+    output_dir: Path,
+    title: str | None = None,
+    emit: Callable[[PipelineEvent], None] | None = None,
+) -> tuple[Path, VideoInfo]:
+    normalized_url, _ = normalize_video_url(url)
+    video_info = probe_video(normalized_url)
+    safe_title = sanitize_filename(title or video_info.title or "video")
+    output_template = str(output_dir / f"{safe_title}_video.%(ext)s")
+
+    def _emit(stage: str, progress: int, message: str, payload: dict | None = None) -> None:
+        if emit is not None:
+            emit(PipelineEvent(stage=stage, progress=progress, message=message, payload=payload or {}))
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    options: dict = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+    }
+    if ffmpeg_path:
+        options["ffmpeg_location"] = str(Path(ffmpeg_path).parent)
+
+    _emit("downloading", 20, "正在下载视频文件（用于关键帧截取）")
+    with YoutubeDL(options) as ydl:
+        ydl.download([normalized_url])
+
+    candidates = sorted(output_dir.glob(f"{safe_title}_video.*"))
+    if not candidates:
+        _emit("downloading", 48, "视频文件下载失败，关键帧截取将不可用")
+        return Path(""), video_info
+
+    _emit("downloading", 48, "视频文件已就绪")
+    return candidates[0], video_info
+
+
 def _format_bytes(value: int) -> str:
     units = ["B", "KB", "MB", "GB"]
     size = float(max(value, 0))

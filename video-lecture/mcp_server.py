@@ -164,6 +164,58 @@ async def process_video(
 
 
 @mcp.tool()
+async def process_local_file(
+    file_path: str,
+    title: str | None = None,
+    language: str = "zh",
+) -> str:
+    """处理本地视频或音频文件，生成结构化课程讲义和思维导图。
+
+    支持的视频格式：mp4, mkv, avi, mov, webm, flv, wmv, ts
+    支持的音频格式：mp3, wav, flac, aac, ogg, m4a, wma
+
+    对于视频文件，会自动提取音频进行转写，并保留视频文件路径用于关键帧截取。
+    对于音频文件，仅进行转写和讲义生成。
+
+    Args:
+        file_path: 本地视频或音频文件的绝对路径
+        title: 视频标题，可选，默认使用文件名
+        language: 转写语言代码，默认 zh
+    """
+    service = _get_service()
+
+    def _run():
+        return service.process_local_file(file_path=file_path, title=title, language=language)
+
+    try:
+        result = await _run_sync(_run)
+    except Exception as exc:
+        logger.exception("process_local_file failed: %s", exc)
+        return json.dumps({
+            "success": False,
+            "error": format_error_for_user(exc),
+        }, ensure_ascii=False, indent=2)
+
+    if not result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": result.get("error", "Unknown error"),
+        }, ensure_ascii=False, indent=2)
+
+    return json.dumps({
+        "success": True,
+        "task_id": result.get("task_id"),
+        "lecture_title": result.get("lecture_title", ""),
+        "sections_count": result.get("sections_count", 0),
+        "transcript_chars": result.get("transcript_chars", 0),
+        "lecture_md": _truncate(result.get("lecture_md", ""), 12000),
+        "mindmap_mermaid": _truncate(result.get("mindmap_mermaid", ""), 4000),
+        "transcript": _truncate(result.get("transcript", ""), 6000),
+        "video_file_path": result.get("video_file_path", ""),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def resummary(task_id: str) -> str:
     """复用已有任务的转写文本，重新生成讲义和思维导图。
 
@@ -555,6 +607,7 @@ async def save_results(
     output_dir: str,
     title: str | None = None,
     language: str = "zh",
+    extract_keyframes_flag: bool = False,
 ) -> str:
     """处理视频并将结果保存到指定目录的文件中。
 
@@ -563,17 +616,25 @@ async def save_results(
     - lecture.md: Markdown 格式课程讲义
     - mindmap.mmd: Mermaid 格式思维导图
     - result.json: 完整结果 JSON
+    - keyframes/ (可选): 关键帧截图目录
 
     Args:
         url: 视频链接（同 process_video 支持的格式）
         output_dir: 输出目录的绝对路径
         title: 视频标题，可选
         language: 转写语言代码，默认 zh
+        extract_keyframes_flag: 是否自动提取关键帧截图，默认 False
     """
     service = _get_service()
 
     def _run():
-        return service.process_and_wait(url=url, title=title, language=language, output_dir=output_dir)
+        result = service.process_and_wait(url=url, title=title, language=language, output_dir=output_dir)
+        if result.get("success") and extract_keyframes_flag:
+            task_id = result.get("task_id")
+            if task_id:
+                kf_result = service.extract_keyframes(task_id=task_id)
+                result["keyframes"] = kf_result
+        return result
 
     try:
         result = await _run_sync(_run)

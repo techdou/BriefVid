@@ -6,6 +6,7 @@ from typing import Callable
 
 import httpx
 
+from video_lecture_skill.llm import extract_json, safe_int
 from video_lecture_skill.models import (
     LectureNote,
     MindmapNode,
@@ -130,7 +131,7 @@ def _generate_mindmap_llm(
     result_json = response.json()
     content = result_json["choices"][0]["message"]["content"]
     usage = result_json.get("usage") or {}
-    parsed = _extract_json(content)
+    parsed = extract_json(content)
 
     tree = _parse_tree(parsed.get("root") or {})
     mermaid = _tree_to_mermaid(title, tree)
@@ -139,9 +140,9 @@ def _generate_mindmap_llm(
         title=str(parsed.get("title") or title or "思维导图"),
         mermaid=mermaid,
         tree=tree,
-        llm_prompt_tokens=_safe_int(usage.get("prompt_tokens")),
-        llm_completion_tokens=_safe_int(usage.get("completion_tokens")),
-        llm_total_tokens=_safe_int(usage.get("total_tokens")),
+        llm_prompt_tokens=safe_int(usage.get("prompt_tokens")),
+        llm_completion_tokens=safe_int(usage.get("completion_tokens")),
+        llm_total_tokens=safe_int(usage.get("total_tokens")),
     )
 
 
@@ -184,32 +185,6 @@ def _render_mermaid_node(node: MindmapNode, indent: int, lines: list[str]) -> No
         _render_mermaid_node(child, indent + 2, lines)
 
 
-def _extract_json(content: str) -> dict:
-    text = content.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
-    for attempt_text in [content.strip(), text]:
-        if not attempt_text:
-            continue
-        try:
-            return json.loads(attempt_text)
-        except json.JSONDecodeError:
-            try:
-                return json.loads(attempt_text, strict=False)
-            except json.JSONDecodeError:
-                continue
-    raise RuntimeError("LLM returned invalid JSON for mindmap")
-
-
 def _parse_tree(data: dict) -> MindmapNode:
     if not isinstance(data, dict):
         return MindmapNode(label="root")
@@ -220,9 +195,3 @@ def _parse_tree(data: dict) -> MindmapNode:
             children.append(_parse_tree(child))
     return MindmapNode(label=label[:50], children=children)
 
-
-def _safe_int(value: object) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None

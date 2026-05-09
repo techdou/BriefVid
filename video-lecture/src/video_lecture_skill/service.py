@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
 from video_lecture_skill.config import SkillSettings
-from video_lecture_skill.download import download_audio, normalize_video_url
+from video_lecture_skill.download import download_audio, download_video, normalize_video_url
 from video_lecture_skill.errors import format_error_for_user
 from video_lecture_skill.export import (
     export_json,
@@ -36,6 +37,7 @@ from video_lecture_skill.models import (
     TaskInput,
     TagItem,
     TranscriptionResult,
+    VideoInfo,
     VideoTagRecord,
 )
 from video_lecture_skill.mindmap import generate_mindmap
@@ -155,6 +157,126 @@ class VideoLectureService:
         page_number: int | None = None,
     ) -> dict:
         return self.process(url, title, language, wait=True, output_dir=output_dir, page_number=page_number)
+
+    def process_local_file(
+        self,
+        file_path: str,
+        title: str | None = None,
+        language: str = "zh",
+        output_dir: str | None = None,
+    ) -> dict:
+        local_path = Path(file_path).expanduser().resolve()
+        if not local_path.exists():
+            return {"success": False, "error": f"文件不存在: {file_path}"}
+        if not local_path.is_file():
+            return {"success": False, "error": f"路径不是文件: {file_path}"}
+
+        task_id = uuid4().hex[:12]
+        task_dir = self.settings.tasks_dir / task_id
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts"}
+        audio_extensions = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma"}
+        suffix = local_path.suffix.lower()
+
+        if suffix in video_extensions:
+            audio_path = task_dir / f"{local_path.stem}.mp3"
+            try:
+                import subprocess
+                ffmpeg_cmd = shutil.which("ffmpeg")
+                if not ffmpeg_cmd:
+                    return {"success": False, "error": "ffmpeg 未安装，无法从视频提取音频"}
+                subprocess.run(
+                    [ffmpeg_cmd, "-i", str(local_path), "-vn", "-acodec", "libmp3lame", "-q:a", "2", str(audio_path)],
+                    check=True,
+                    capture_output=True,
+                )
+            except Exception as exc:
+                return {"success": False, "error": f"音频提取失败: {exc}"}
+
+            video_file_path = str(local_path)
+
+        elif suffix in audio_extensions:
+            audio_path = local_path
+            video_file_path = ""
+        else:
+            return {"success": False, "error": f"不支持的文件格式: {suffix}，支持的视频格式: {video_extensions}，音频格式: {audio_extensions}"}
+
+        effective_title = title or local_path.stem
+        video_info = VideoInfo(
+            url=f"file://{local_path}",
+            title=effective_title,
+            platform="local",
+            duration=None,
+        )
+
+        try:
+            transcription = transcribe_audio(
+                audio_path=audio_path,
+                mode=self.settings.transcribe_mode,
+                language=language,
+                whisper_model=self.settings.whisper_model,
+                whisper_device=self.settings.whisper_device,
+                whisper_compute_type=self.settings.whisper_compute_type,
+                openai_api_key=self.settings.openai_api_key,
+                openai_base_url=self.settings.openai_base_url,
+                duration=video_info.duration,
+            )
+
+            lecture = generate_lecture(
+                transcription=transcription,
+                title=effective_title,
+                api_key=self.settings.openai_api_key,
+                base_url=self.settings.openai_base_url,
+                model=self.settings.openai_model,
+                chunk_target_chars=self.settings.summary_chunk_target_chars,
+                chunk_overlap_segments=self.settings.summary_chunk_overlap_segments,
+                chunk_concurrency=self.settings.summary_chunk_concurrency,
+                chunk_retry_count=self.settings.summary_chunk_retry_count,
+            )
+
+            mindmap = generate_mindmap(
+                transcription=transcription,
+                lecture=lecture,
+                title=effective_title,
+                api_key=self.settings.openai_api_key,
+                base_url=self.settings.openai_base_url,
+                model=self.settings.openai_model,
+            )
+
+            result = PipelineResult(
+                video_info=video_info,
+                transcription=transcription,
+                lecture=lecture,
+                mindmap=mindmap,
+                video_file_path=video_file_path,
+            )
+
+            self._task_results[task_id] = result
+            self._evict_old_tasks()
+
+            if output_dir:
+                artifacts = export_to_files(result, Path(output_dir))
+                result = result.model_copy(update={"artifacts": artifacts})
+
+            return {
+                "success": True,
+                "task_id": task_id,
+                "video_id": video_info.id,
+                "status": "completed",
+                "lecture_md": export_markdown(result),
+                "mindmap_mermaid": export_mermaid(result),
+                "transcript": export_transcript(result),
+                "lecture_title": lecture.title,
+                "sections_count": len(lecture.sections),
+                "transcript_chars": len(transcription.transcript),
+                "artifacts": result.artifacts,
+                "video_file_path": video_file_path,
+            }
+
+        except Exception as exc:
+            logger.exception("process_local_file failed task_id=%s error=%s", task_id, exc)
+            return {"success": False, "task_id": task_id, "error": format_error_for_user(exc)}
 
     def resummary(
         self,
@@ -549,7 +671,21 @@ def run_sync(
         emit=_emit,
     )
     result.video_info = video_info
-    result.video_file_path = str(audio_path)
+
+    video_file_path = ""
+    try:
+        video_path, _ = download_video(
+            url=normalized_url,
+            output_dir=task_dir,
+            title=task_input.title,
+            emit=_emit,
+        )
+        if video_path and video_path.exists():
+            video_file_path = str(video_path)
+    except Exception as exc:
+        logger.info("video file download skipped (keyframes unavailable): %s", exc)
+
+    result.video_file_path = video_file_path
 
     _emit("transcribing", 50, f"开始语音转写（{settings.transcribe_mode.value}模式）")
 

@@ -9,12 +9,14 @@ from typing import Callable
 
 import httpx
 
+from video_lecture_skill.llm import extract_json, safe_int
 from video_lecture_skill.models import (
     LectureNote,
     LectureSection,
     PipelineEvent,
     Segment,
     TranscriptionResult,
+    format_timestamp,
 )
 
 logger = logging.getLogger("video_lecture_skill.lecture")
@@ -156,12 +158,12 @@ def _generate_lecture_llm(
         segments_excerpt=aggregate_segments,
     )
 
-    total_prompt = sum(_safe_int(p.get("llm_prompt_tokens")) or 0 for p in partial_summaries)
-    total_completion = sum(_safe_int(p.get("llm_completion_tokens")) or 0 for p in partial_summaries)
-    total_tokens = sum(_safe_int(p.get("llm_total_tokens")) or 0 for p in partial_summaries)
-    merged["llm_prompt_tokens"] = total_prompt + (_safe_int(merged.get("llm_prompt_tokens")) or 0)
-    merged["llm_completion_tokens"] = total_completion + (_safe_int(merged.get("llm_completion_tokens")) or 0)
-    merged["llm_total_tokens"] = total_tokens + (_safe_int(merged.get("llm_total_tokens")) or 0)
+    total_prompt = sum(safe_int(p.get("llm_prompt_tokens")) or 0 for p in partial_summaries)
+    total_completion = sum(safe_int(p.get("llm_completion_tokens")) or 0 for p in partial_summaries)
+    total_tokens = sum(safe_int(p.get("llm_total_tokens")) or 0 for p in partial_summaries)
+    merged["llm_prompt_tokens"] = total_prompt + (safe_int(merged.get("llm_prompt_tokens")) or 0)
+    merged["llm_completion_tokens"] = total_completion + (safe_int(merged.get("llm_completion_tokens")) or 0)
+    merged["llm_total_tokens"] = total_tokens + (safe_int(merged.get("llm_total_tokens")) or 0)
 
     return _parse_lecture_json(merged, title)
 
@@ -213,37 +215,11 @@ def _request_lecture(
     result_json = response.json()
     content = result_json["choices"][0]["message"]["content"]
     usage = result_json.get("usage") or {}
-    parsed = _extract_json(content)
-    parsed["llm_prompt_tokens"] = _safe_int(usage.get("prompt_tokens"))
-    parsed["llm_completion_tokens"] = _safe_int(usage.get("completion_tokens"))
-    parsed["llm_total_tokens"] = _safe_int(usage.get("total_tokens"))
+    parsed = extract_json(content)
+    parsed["llm_prompt_tokens"] = safe_int(usage.get("prompt_tokens"))
+    parsed["llm_completion_tokens"] = safe_int(usage.get("completion_tokens"))
+    parsed["llm_total_tokens"] = safe_int(usage.get("total_tokens"))
     return parsed
-
-
-def _extract_json(content: str) -> dict:
-    text = content.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
-    for attempt_text in [content.strip(), text]:
-        if not attempt_text:
-            continue
-        try:
-            return json.loads(attempt_text)
-        except json.JSONDecodeError:
-            try:
-                return json.loads(attempt_text, strict=False)
-            except json.JSONDecodeError:
-                continue
-    raise RuntimeError("LLM returned invalid JSON for lecture")
 
 
 def _parse_lecture_json(data: dict, fallback_title: str) -> LectureNote:
@@ -267,9 +243,9 @@ def _parse_lecture_json(data: dict, fallback_title: str) -> LectureNote:
         sections=sections,
         summary=str(data.get("summary") or ""),
         references=[str(r) for r in (data.get("references") or []) if str(r).strip()],
-        llm_prompt_tokens=_safe_int(data.get("llm_prompt_tokens")),
-        llm_completion_tokens=_safe_int(data.get("llm_completion_tokens")),
-        llm_total_tokens=_safe_int(data.get("llm_total_tokens")),
+        llm_prompt_tokens=safe_int(data.get("llm_prompt_tokens")),
+        llm_completion_tokens=safe_int(data.get("llm_completion_tokens")),
+        llm_total_tokens=safe_int(data.get("llm_total_tokens")),
     )
 
 
@@ -327,7 +303,7 @@ def _build_chunks(segments: list[Segment], target_chars: int, overlap: int) -> l
             current = [segments[start]]
             cursor = start + 1
 
-        chunk_lines = [f"[{_fmt_sec(s.start)}] {s.text}" for s in current if s.text.strip()]
+        chunk_lines = [f"[{format_timestamp(s.start)}] {s.text}" for s in current if s.text.strip()]
         compact = [{"start": s.start, "text": s.text.strip()[:120]} for s in current if s.text.strip()]
         chunks.append({
             "index": index,
@@ -362,14 +338,3 @@ def _build_aggregate_inputs(partials: list[dict]) -> tuple[str, str]:
         lines.append("")
     return "\n".join(lines).strip()[:5200], json.dumps(segments, ensure_ascii=False)[:2600]
 
-
-def _fmt_sec(value: float) -> str:
-    total = max(0, int(value))
-    return f"{total // 60:02d}:{total % 60:02d}"
-
-
-def _safe_int(value: object) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
