@@ -1,11 +1,12 @@
 name: video-lecture
-version: 0.1.0
+version: 0.2.0
 description:
-  short: "视频转讲义与思维导图 — 输入视频链接，自动生成 Markdown 讲义和 Mermaid 思维导图"
+  short: "视频转讲义与思维导图 — 输入视频链接，自动生成 Markdown 讲义、Mermaid 思维导图和 Obsidian 笔记"
   full: |
     Video Lecture Skill 将视频内容自动转换为结构化课程讲义和可视化思维导图。
-    支持 B站、YouTube、抖音等多平台视频源，自动完成下载、转码、语音转写、LLM 生成讲义、生成思维导图的全流程。
-    适用于学习笔记整理、知识提炼、课程内容归档等场景。
+    支持 B站（含多P）、YouTube、抖音等多平台视频源，自动完成下载、转码、语音转写、LLM 生成讲义、生成思维导图的全流程。
+    新增知识库 RAG 搜索与问答、自动标签与标签网络、多P视频聚合摘要、重摘要、Obsidian 导出等高级功能。
+    适用于学习笔记整理、知识提炼、课程内容归档、知识库构建等场景。
 author:
   name: community
   email: ""
@@ -16,6 +17,10 @@ tags:
   - transcription
   - whisper
   - llm
+  - knowledge-base
+  - rag
+  - tagging
+  - obsidian
 keywords:
   - video
   - lecture
@@ -27,9 +32,13 @@ keywords:
   - youtube
   - agent
   - skill
+  - knowledge
+  - rag
+  - obsidian
+  - tagging
 homepage: ""
 license: MIT
-api_version: "v1"
+api_version: "v2"
 entry_point: video_lecture_skill.api:app
 cli_entry: video_lecture_skill.cli:main
 config_prefix: VLEC_
@@ -42,7 +51,7 @@ requires:
 capabilities:
   - id: video_download
     description: 从 B站/YouTube/抖音 等平台下载视频并提取音频
-    platforms: [bilibili, youtube, douyin, generic]
+    platforms: [bilibili, youtube, douyin, generic, local]
   - id: audio_transcription
     description: 语音转文字，支持本地 Whisper 和云 API 双模式
     modes: [local, cloud]
@@ -53,11 +62,32 @@ capabilities:
     description: 生成 Mermaid 格式的层级思维导图
     formats: [mermaid, json]
   - id: multi_format_export
-    description: 多格式导出（Markdown/Mermaid/JSON/TXT）
+    description: 多格式导出（Markdown/Mermaid/JSON/TXT/Obsidian）
   - id: progress_tracking
     description: 实时进度追踪，支持 SSE 流式推送
   - id: error_recovery
     description: 自动降级和优雅错误处理
+  - id: knowledge_base_rag
+    description: 知识库 RAG 搜索与问答，基于 ChromaDB + sentence-transformers 向量索引
+    requires: [chromadb, sentence-transformers]
+  - id: knowledge_search
+    description: 语义搜索已处理视频的摘要、章节和知识笔记
+  - id: knowledge_qa
+    description: 基于知识库片段的 LLM 问答，支持多轮对话上下文
+  - id: auto_tagging
+    description: LLM 自动为视频生成标签，支持批量自动打标签
+  - id: tag_network
+    description: 标签共现网络可视化，支持聚焦模式和概览模式
+  - id: multi_page_video
+    description: B站多P视频支持，可指定分P号处理
+  - id: aggregate_summary
+    description: 多P视频聚合摘要，汇总各分P结果生成合集总结
+  - id: resummary
+    description: 重摘要，复用已有转写文本重新生成讲义和思维导图
+  - id: obsidian_export
+    description: 导出为 Obsidian 格式笔记，含 YAML frontmatter 元数据
+  - id: local_video_upload
+    description: 支持本地视频/音频文件处理
 parameters:
   url:
     type: string
@@ -84,12 +114,28 @@ parameters:
     description: 输出格式列表
     items:
       type: string
-      enum: [markdown, mermaid, json]
+      enum: [markdown, mermaid, json, obsidian]
   transcribe_mode:
     type: string
     required: false
     description: 转写模式
     enum: [local, cloud]
+  page_number:
+    type: integer
+    required: false
+    description: B站多P视频分P号（可选，默认处理第1P）
+  task_ids:
+    type: string
+    required: false
+    description: 聚合摘要时使用的任务ID列表（逗号分隔）
+  query:
+    type: string
+    required: false
+    description: 知识库搜索或问答的查询文本
+  tags:
+    type: string
+    required: false
+    description: 标签过滤或添加的标签（逗号分隔）
 outputs:
   lecture_md:
     type: string
@@ -109,6 +155,19 @@ outputs:
   artifacts:
     type: object
     description: 输出文件路径映射
+  obsidian_note:
+    type: string
+    description: Obsidian 格式笔记（含 YAML frontmatter）
+    format: text/markdown
+  knowledge_search_results:
+    type: array
+    description: 知识库语义搜索结果
+  knowledge_answer:
+    type: string
+    description: 知识库 RAG 问答回答
+  tag_network:
+    type: object
+    description: 标签共现网络数据（nodes + links）
 events:
   - stage: preparing
     description: 规范化视频链接
@@ -128,6 +187,9 @@ events:
   - stage: exporting
     description: 导出结果文件
     progress: 97-100
+  - stage: indexing
+    description: 索引到知识库
+    progress: 100
   - stage: completed
     description: 处理完成
     progress: 100
@@ -147,13 +209,24 @@ errors:
   - code: TIMEOUT
     message: 处理超时
     recoverable: true
+  - code: KNOWLEDGE_NOT_ENABLED
+    message: 知识库未启用
+    recoverable: true
+  - code: KNOWLEDGE_DEPENDENCY_MISSING
+    message: 知识库依赖未安装（chromadb/sentence-transformers）
+    recoverable: true
+  - code: TASK_NOT_FOUND
+    message: 指定任务不存在
+    recoverable: false
 limits:
   max_video_duration_seconds: 7200
   max_transcript_chars: 500000
   max_lecture_sections: 20
   max_concurrent_tasks: 5
+  max_knowledge_search_results: 50
+  max_tag_network_nodes: 50
 metadata:
   created_at: "2024-01-01"
-  updated_at: "2024-01-01"
+  updated_at: "2026-05-09"
   stability: stable
   breaking_changes: false

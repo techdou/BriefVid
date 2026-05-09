@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime
 from pathlib import Path
 
 from video_lecture_skill.models import (
@@ -117,3 +119,168 @@ def export_to_files(result: PipelineResult, output_dir: Path) -> dict[str, str]:
     artifacts["result_json"] = str(result_path)
 
     return artifacts
+
+
+def _build_frontmatter(payload: dict[str, object]) -> str:
+    lines = ["---"]
+    for key, value in payload.items():
+        if isinstance(value, list):
+            lines.append(f"{key}:")
+            for item in value:
+                lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+            continue
+        lines.append(f"{key}: {json.dumps(str(value or ''), ensure_ascii=False)}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def _format_key_points(key_points: list[str]) -> str:
+    items = [str(item).strip() for item in key_points if str(item).strip()]
+    if not items:
+        return "- 暂无关键要点。"
+    return "\n".join(f"- {item}" for item in items)
+
+
+def _format_timeline(timeline: list[dict[str, object]]) -> str:
+    items: list[str] = []
+    for entry in timeline:
+        title = str(entry.get("title") or "").strip() or "未命名章节"
+        summary = str(entry.get("summary") or "").strip()
+        start = _format_timestamp(entry.get("start"))
+        line = f"- `{start}` **{title}**"
+        if summary:
+            line = f"{line}: {summary}"
+        items.append(line)
+    if not items:
+        return "- 暂无章节时间线。"
+    return "\n".join(items)
+
+
+def _format_timestamp(value: object) -> str:
+    try:
+        total_seconds = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        total_seconds = 0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _normalize_embedded_note(markdown: str, title: str) -> str:
+    text = str(markdown or "").strip()
+    if not text:
+        return "暂无知识笔记正文。"
+    lines = text.splitlines()
+    if lines and lines[0].lstrip().startswith("#"):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    normalized = "\n".join(lines).strip()
+    return normalized or "暂无知识笔记正文。"
+
+
+def _build_markdown_body(
+    *,
+    title: str,
+    overview: str,
+    knowledge_note_markdown: str,
+    key_points: list[str],
+    timeline: list[dict[str, object]],
+    mindmap_mermaid: str | None = None,
+) -> str:
+    sections = [
+        f"# {title}",
+        "## 核心概览",
+        str(overview or "").strip() or "暂无核心概览。",
+        "## 关键要点",
+        _format_key_points(key_points),
+        "## 章节时间线",
+        _format_timeline(timeline),
+        "## 知识笔记",
+        _normalize_embedded_note(knowledge_note_markdown, title),
+    ]
+    if mindmap_mermaid:
+        sections.extend([
+            "## 思维导图",
+            "```mermaid",
+            mindmap_mermaid,
+            "```",
+        ])
+    return "\n\n".join(section.strip() for section in sections if str(section).strip())
+
+
+def export_obsidian(
+    result: PipelineResult,
+    *,
+    source_url: str = "",
+    platform: str = "",
+    video_id: str = "",
+    task_id: str = "",
+    tags: list[str] | None = None,
+    created_at: datetime | None = None,
+) -> str:
+    title = result.lecture.title or result.video_info.title or "视频笔记"
+    body = _build_markdown_body(
+        title=title,
+        overview=result.overview or result.lecture.overview,
+        knowledge_note_markdown=result.knowledge_note_markdown,
+        key_points=result.key_points,
+        timeline=result.timeline,
+        mindmap_mermaid=result.mindmap.mermaid or None,
+    )
+    export_time = datetime.now()
+    frontmatter = _build_frontmatter({
+        "title": title,
+        "source_url": str(source_url or result.video_info.url or ""),
+        "platform": str(platform or result.video_info.platform or ""),
+        "video_id": str(video_id or result.video_info.canonical_id or ""),
+        "task_id": str(task_id or ""),
+        "created_at": (created_at or export_time).isoformat(),
+        "exported_at": export_time.isoformat(),
+        "tags": [str(tag).strip() for tag in (tags or result.tags or []) if str(tag).strip()],
+    })
+    return f"{frontmatter}\n\n{body}".strip()
+
+
+def export_obsidian_to_file(
+    result: PipelineResult,
+    output_dir: Path,
+    *,
+    source_url: str = "",
+    platform: str = "",
+    video_id: str = "",
+    task_id: str = "",
+    tags: list[str] | None = None,
+    created_at: datetime | None = None,
+) -> tuple[Path, bool]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    title = result.lecture.title or result.video_info.title or "视频笔记"
+    safe_title = re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|]', "", title)).strip(" .") or "VideoNote"
+    export_time = datetime.now()
+    file_name = f"{safe_title} {export_time.date().isoformat()}.md"
+
+    content = export_obsidian(
+        result,
+        source_url=source_url,
+        platform=platform,
+        video_id=video_id,
+        task_id=task_id,
+        tags=tags,
+        created_at=created_at,
+    )
+
+    base_candidate = output_dir / file_name
+    suffix = base_candidate.suffix or ".md"
+    stem = base_candidate.stem
+    counter = 1
+    while True:
+        candidate = base_candidate if counter == 1 else output_dir / f"{stem} ({counter}){suffix}"
+        try:
+            with candidate.open("x", encoding="utf-8") as handle:
+                handle.write(content)
+        except FileExistsError:
+            counter += 1
+            continue
+        return candidate, counter > 1

@@ -39,6 +39,22 @@ class Segment(BaseModel):
     text: str
 
 
+class InputType(str, Enum):
+    URL = "url"
+    VIDEO_FILE = "video_file"
+    AUDIO_FILE = "audio_file"
+    TRANSCRIPT_TEXT = "transcript_text"
+
+
+class VideoPageInfo(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    page: int = 1
+    title: str = ""
+    source_url: str = ""
+    cover_url: str = ""
+    duration: float | None = None
+
+
 class VideoInfo(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: str = Field(default_factory=lambda: uuid4().hex)
@@ -48,6 +64,8 @@ class VideoInfo(BaseModel):
     duration: float | None = None
     thumbnail: str = ""
     canonical_id: str = ""
+    pages: list[VideoPageInfo] = Field(default_factory=list)
+    is_multi_page: bool = False
 
     def to_openapi(self) -> dict:
         return {
@@ -142,10 +160,100 @@ class MindmapResult(BaseModel):
     llm_total_tokens: int | None = None
 
 
+class KnowledgeSearchResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    video_id: str = ""
+    title: str = ""
+    relevance_score: float = 0.0
+    snippet: str = ""
+    tags: list[str] = Field(default_factory=list)
+    cover_url: str = ""
+    timestamp: str | None = None
+    video_title: str = ""
+    page_title: str | None = None
+    page_number: int | None = None
+
+
+class KnowledgeSourceRef(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    video_id: str = ""
+    title: str = ""
+    relevance_score: float = 0.0
+    timestamp: str | None = None
+    video_title: str = ""
+    page_title: str | None = None
+    page_number: int | None = None
+
+
+class KnowledgeAskResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    query: str = ""
+    answer: str = ""
+    sources: list[KnowledgeSourceRef] = Field(default_factory=list)
+
+
+class KnowledgeChatHistoryItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    role: str = "user"
+    content: str = ""
+
+
+class TagItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    tag: str = ""
+    count: int = 0
+
+
+class VideoTagRecord(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    video_id: str = ""
+    tag: str = ""
+    source: str = "manual"
+    confidence: float = 1.0
+
+
+class KnowledgeNetworkNode(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    id: str = ""
+    label: str = ""
+    type: str = "tag"
+    count: int = 0
+    degree: int = 0
+    focus: bool = False
+    video_count: int = 0
+    tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeNetworkLink(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    source: str = ""
+    target: str = ""
+    weight: float = 1.0
+    kind: str = "cooccurrence"
+
+
+class KnowledgeNetworkResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    nodes: list[KnowledgeNetworkNode] = Field(default_factory=list)
+    links: list[KnowledgeNetworkLink] = Field(default_factory=list)
+    mode: str = "overview"
+    hidden_tag_count: int = 0
+    selected_tags: list[str] = Field(default_factory=list)
+
+
+class KnowledgeStatsResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    video_count: int = 0
+    indexed_chunk_count: int = 0
+    tag_count: int = 0
+    untagged_video_count: int = 0
+    knowledge_llm_available: bool = False
+
+
 class TaskInput(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: str = Field(default_factory=lambda: uuid4().hex)
-    url: str = Field(..., min_length=1, description="视频链接")
+    url: str = Field("", description="视频链接")
     title: str | None = Field(None, description="视频标题（可选）")
     language: str = Field("zh", description="转写语言")
     output_formats: list[TaskOutputFormat] = Field(
@@ -153,6 +261,9 @@ class TaskInput(BaseModel):
         description="输出格式列表",
     )
     transcribe_mode: TranscribeMode | None = Field(None, description="转写模式")
+    input_type: InputType = Field(InputType.URL, description="输入类型")
+    page_number: int | None = Field(None, description="B站多P视频分P号")
+    source_transcript: str | None = Field(None, description="重摘要时复用的转写文本")
 
     def to_openapi(self) -> dict:
         return {
@@ -194,6 +305,14 @@ class PipelineResult(BaseModel):
     lecture: LectureNote = Field(default_factory=LectureNote)
     mindmap: MindmapResult = Field(default_factory=MindmapResult)
     artifacts: dict[str, str] = Field(default_factory=dict)
+    overview: str = ""
+    key_points: list[str] = Field(default_factory=list)
+    knowledge_note_markdown: str = ""
+    timeline: list[dict[str, object]] = Field(default_factory=list)
+    segment_summaries: list[str] = Field(default_factory=list)
+    mindmap_status: str | None = None
+    mindmap_error_message: str | None = None
+    tags: list[str] = Field(default_factory=list)
 
 
 class TaskRecord(BaseModel):
@@ -204,6 +323,9 @@ class TaskRecord(BaseModel):
     status: TaskStatus = TaskStatus.QUEUED
     result: PipelineResult | None = None
     error_message: str | None = None
+    video_id: str | None = None
+    page_number: int | None = None
+    page_title: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
