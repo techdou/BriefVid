@@ -6,6 +6,7 @@ from collections import Counter
 from itertools import combinations
 
 from video_lecture_skill.config import SkillSettings
+from video_lecture_skill.llm import chat_completion
 from video_lecture_skill.models import (
     KnowledgeNetworkLink,
     KnowledgeNetworkNode,
@@ -15,50 +16,6 @@ from video_lecture_skill.models import (
 )
 
 logger = logging.getLogger("video_lecture_skill.tags")
-
-
-def _chat_tag_llm(
-    settings: SkillSettings,
-    system_prompt: str,
-    user_prompt: str,
-    require_json: bool = True,
-    max_tokens: int = 200,
-    temperature: float = 0.1,
-) -> str:
-    config = settings.effective_knowledge_llm_config
-    if not config["api_key"]:
-        return ""
-
-    import httpx
-
-    headers = {
-        "Authorization": f"Bearer {config['api_key']}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": config["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if require_json:
-        payload["response_format"] = {"type": "json_object"}
-    try:
-        with httpx.Client(timeout=30) as client:
-            response = client.post(
-                f"{config['base_url']}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-            return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
-    except Exception as exc:
-        logger.warning("tag LLM call failed: %s", exc)
-        return ""
 
 
 def _parse_json_payload(text: str) -> dict:
@@ -125,7 +82,7 @@ class TagStore:
         if not content.strip():
             return []
 
-        response_text = _chat_tag_llm(
+        response_text = chat_completion(
             self._settings,
             system_prompt=(
                 "你是一个知识库标签助手。请根据视频摘要和知识笔记，为视频生成 3 到 8 个简洁中文标签。"
@@ -133,6 +90,10 @@ class TagStore:
             ),
             user_prompt=content,
             require_json=True,
+            max_tokens=200,
+            temperature=0.1,
+            timeout=30,
+            fallback="",
         )
         payload = _parse_json_payload(response_text)
         raw_tags = payload.get("tags")

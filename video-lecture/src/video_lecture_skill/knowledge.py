@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import Iterator
 
 from video_lecture_skill.config import SkillSettings
+from video_lecture_skill.llm import chat_completion
 from video_lecture_skill.models import (
     KnowledgeAskResponse,
     KnowledgeChatHistoryItem,
     KnowledgeSearchResult,
     KnowledgeSourceRef,
     PipelineResult,
+    format_timestamp,
 )
 
 logger = logging.getLogger("video_lecture_skill.knowledge")
@@ -35,12 +37,7 @@ EMPTY_KNOWLEDGE_ANSWER = "这次没有检索到足够相关的知识片段。可
 def format_anchor_seconds(seconds: float | None) -> str | None:
     if seconds is None:
         return None
-    total = max(0, int(seconds))
-    minutes, sec = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
-    return f"{minutes:02d}:{sec:02d}"
+    return format_timestamp(seconds)
 
 
 def _import_optional(module_name: str):
@@ -216,7 +213,12 @@ class KnowledgeStore:
                 count += 1
         return count
 
-    def search(self, query: str, limit: int = 10, tag_filter: list[str] | None = None) -> list[KnowledgeSearchResult]:
+    def _query_candidates(
+        self,
+        query: str,
+        limit: int,
+        tag_filter: list[str] | None = None,
+    ) -> list[dict[str, object]]:
         cleaned_query = str(query or "").strip()
         if not cleaned_query:
             return []
@@ -256,6 +258,12 @@ class KnowledgeStore:
                 "metadata": metadata,
                 "relevance_score": round(relevance, 4),
             })
+        return candidates
+
+    def search(self, query: str, limit: int = 10, tag_filter: list[str] | None = None) -> list[KnowledgeSearchResult]:
+        candidates = self._query_candidates(query, limit, tag_filter)
+        if not candidates:
+            return []
 
         grouped: dict[str, dict[str, object]] = {}
         for candidate in candidates:
@@ -270,7 +278,7 @@ class KnowledgeStore:
             video_id = str(candidate["video_id"])
             result = self._video_results.get(video_id)
             metadata = candidate["metadata"] if isinstance(candidate["metadata"], dict) else {}
-            video_title = result.lecture.title or result.video_info.title if result else str(metadata.get("title") or "未知视频")
+            video_title = (result.lecture.title or result.video_info.title) if result else str(metadata.get("title") or "未知视频")
             snippet = str(candidate["document"]).strip().replace("\n", " ")
             snippet = snippet[:180].rstrip() + ("..." if len(snippet) > 180 else "")
             tags = self._video_tags.get(video_id, [])
@@ -286,45 +294,7 @@ class KnowledgeStore:
         return results
 
     def search_chunks(self, query: str, limit: int = 5, tag_filter: list[str] | None = None) -> list[dict[str, object]]:
-        cleaned_query = str(query or "").strip()
-        if not cleaned_query:
-            return []
-
-        query_embedding = self._embed_texts([cleaned_query])[0]
-        effective_limit = max(limit * 4, 12)
-        query_result = self._get_collection().query(
-            query_embeddings=[query_embedding],
-            n_results=effective_limit,
-        )
-
-        ids = query_result.get("ids", [[]])[0] if isinstance(query_result, dict) else []
-        documents = query_result.get("documents", [[]])[0] if isinstance(query_result, dict) else []
-        metadatas = query_result.get("metadatas", [[]])[0] if isinstance(query_result, dict) else []
-        distances = query_result.get("distances", [[]])[0] if isinstance(query_result, dict) else []
-
-        allowed_video_ids: set[str] | None = None
-        if tag_filter:
-            selected = {tag.strip() for tag in tag_filter if str(tag).strip()}
-            if selected:
-                allowed_video_ids = {
-                    vid for vid, tags in self._video_tags.items() if selected & set(tags)
-                }
-
-        candidates: list[dict[str, object]] = []
-        for index, chunk_id in enumerate(ids):
-            metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
-            video_id = str(metadata.get("video_id") or "")
-            if allowed_video_ids is not None and video_id not in allowed_video_ids:
-                continue
-            distance = float(distances[index]) if index < len(distances) else 1.0
-            relevance = max(0.0, 1.0 - distance / 2.0)
-            candidates.append({
-                "chunk_id": chunk_id,
-                "video_id": video_id,
-                "document": documents[index] if index < len(documents) else "",
-                "metadata": metadata,
-                "relevance_score": round(relevance, 4),
-            })
+        candidates = self._query_candidates(query, limit, tag_filter)
         return candidates[:max(1, limit)]
 
 
@@ -355,47 +325,6 @@ def _build_knowledge_user_prompt(
     )
 
 
-def _chat_knowledge_llm(
-    settings: SkillSettings,
-    system_prompt: str,
-    user_prompt: str,
-    max_tokens: int = 1100,
-    temperature: float = 0.28,
-) -> str:
-    config = settings.effective_knowledge_llm_config
-    if not config["api_key"]:
-        return EMPTY_KNOWLEDGE_ANSWER
-
-    import httpx
-
-    headers = {
-        "Authorization": f"Bearer {config['api_key']}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": config["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.post(
-                f"{config['base_url']}/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-            return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
-    except Exception as exc:
-        logger.warning("knowledge LLM call failed: %s", exc)
-        return EMPTY_KNOWLEDGE_ANSWER
-
-
 class KnowledgeAgent:
     def __init__(self, store: KnowledgeStore, settings: SkillSettings) -> None:
         self._store = store
@@ -422,7 +351,7 @@ class KnowledgeAgent:
             video_id = str(item["video_id"])
             metadata = item["metadata"] if isinstance(item["metadata"], dict) else {}
             result = self._store._video_results.get(video_id)
-            video_title = result.lecture.title or result.video_info.title if result else "未知视频"
+            video_title = (result.lecture.title or result.video_info.title) if result else "未知视频"
             anchor_seconds = float(metadata["anchor_seconds"]) if metadata.get("anchor_seconds") not in {None, "", -1, -1.0} else None
             timestamp = format_anchor_seconds(anchor_seconds)
             context_blocks.append(
@@ -438,9 +367,13 @@ class KnowledgeAgent:
                     timestamp=timestamp,
                 ))
 
-        answer = _chat_knowledge_llm(
+        answer = chat_completion(
             self._settings,
             system_prompt=KNOWLEDGE_QA_SYSTEM_PROMPT,
             user_prompt=_build_knowledge_user_prompt(cleaned_query, context_blocks, history),
+            max_tokens=1100,
+            temperature=0.28,
+            timeout=60,
+            fallback=EMPTY_KNOWLEDGE_ANSWER,
         )
         return KnowledgeAskResponse(query=cleaned_query, answer=answer, sources=sources)

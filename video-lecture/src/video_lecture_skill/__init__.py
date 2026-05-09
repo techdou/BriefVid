@@ -26,6 +26,7 @@ from video_lecture_skill.models import (
     VideoInfo,
     VideoPageInfo,
     VideoTagRecord,
+    format_timestamp,
 )
 from video_lecture_skill.service import VideoLectureService, run_sync
 from video_lecture_skill.config import SkillSettings
@@ -73,4 +74,5 @@ __all__ = [
     "VideoInfo",
     "VideoPageInfo",
     "VideoTagRecord",
+    "format_timestamp",
 ]

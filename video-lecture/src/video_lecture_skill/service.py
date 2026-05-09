@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from video_lecture_skill.config import SkillSettings
@@ -110,7 +112,6 @@ class VideoLectureService:
                 self.knowledge_store.index_video(video_id)
 
             if output_dir:
-                from pathlib import Path
                 artifacts = export_to_files(result, Path(output_dir))
                 result = result.model_copy(update={"artifacts": artifacts})
 
@@ -333,7 +334,6 @@ class VideoLectureService:
 
         target_dir = self.settings.output_dir
         if output_dir:
-            from pathlib import Path
             target_dir = Path(output_dir).expanduser()
         if target_dir is None:
             return {"success": False, "error": "未配置 Obsidian 输出目录，请设置 VLEC_OBSIDIAN_OUTPUT_DIR 或指定 output_dir。"}
@@ -404,11 +404,25 @@ class VideoLectureService:
         return self.tag_store.get_network_data(selected_tags, max_tags=max_tags, max_videos=max_videos)
 
     def get_knowledge_stats(self) -> KnowledgeStatsResponse:
+        indexed_chunk_count = 0
+        try:
+            if self._knowledge_store is not None and self._knowledge_store._collection is not None:
+                existing = self._knowledge_store._collection.get()
+                indexed_chunk_count = len(existing.get("ids", [])) if isinstance(existing, dict) else 0
+        except Exception:
+            pass
+
+        all_tags = self.tag_store.get_all_tags()
+        tagged_video_ids: set[str] = set()
+        for record in self.tag_store.get_all_video_tags():
+            tagged_video_ids.add(record.video_id)
+        untagged_count = max(0, len(self._task_results) - len(tagged_video_ids & set(self._task_results.keys())))
+
         return KnowledgeStatsResponse(
             video_count=len(self._task_results),
-            indexed_chunk_count=0,
-            tag_count=len(self.tag_store.get_all_tags()),
-            untagged_video_count=0,
+            indexed_chunk_count=indexed_chunk_count,
+            tag_count=len(all_tags),
+            untagged_video_count=untagged_count,
             knowledge_llm_available=bool(self.settings.knowledge_enabled and self.settings.openai_api_key),
         )
 
@@ -428,7 +442,6 @@ class VideoLectureService:
         if not video_path:
             return {"success": False, "error": "该任务没有本地视频文件，无法截帧。请确保视频已下载到本地。"}
 
-        from pathlib import Path
         video = Path(video_path)
         if not video.exists():
             return {"success": False, "error": f"视频文件不存在：{video_path}"}
@@ -502,7 +515,7 @@ class VideoLectureService:
 def run_sync(
     task_input: TaskInput,
     settings: SkillSettings,
-    emit: callable | None = None,
+    emit: Callable | None = None,
 ) -> PipelineResult:
     result = PipelineResult()
 
@@ -526,6 +539,7 @@ def run_sync(
         emit=_emit,
     )
     result.video_info = video_info
+    result.video_file_path = str(audio_path)
 
     _emit("transcribing", 50, f"开始语音转写（{settings.transcribe_mode.value}模式）")
 
@@ -584,7 +598,7 @@ def run_sync(
     return result
 
 
-def _export_results(task_dir, title, result):
+def _export_results(task_dir: Path, title: str, result: PipelineResult) -> dict[str, str]:
     artifacts = {}
 
     transcript_path = task_dir / "transcript.txt"

@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
+import sys
 
 from mcp.server.fastmcp import FastMCP
 
@@ -95,7 +98,7 @@ def _resolve_transcribe_mode(mode_str: str | None) -> TranscribeMode | None:
 
 
 async def _run_sync(fn):
-    return await asyncio.get_event_loop().run_in_executor(None, fn)
+    return await asyncio.get_running_loop().run_in_executor(None, fn)
 
 
 @mcp.tool()
@@ -595,9 +598,6 @@ async def setup_check() -> str:
     返回每个依赖项的状态（✅ 就绪 / ❌ 缺失 / ⚠️ 可选未安装）。
     建议在首次使用 video-lecture-skill 前调用此工具确认环境。
     """
-    import shutil
-    import sys
-
     checks: list[dict[str, str]] = []
 
     major, minor = sys.version_info[:2]
@@ -628,7 +628,6 @@ async def setup_check() -> str:
     except ImportError:
         checks.append({"name": "faster-whisper", "status": "missing", "detail": "pip install faster-whisper", "required": "true"})
 
-    import os
     api_key = os.environ.get("VLEC_OPENAI_API_KEY", "")
     checks.append({
         "name": "VLEC_OPENAI_API_KEY",

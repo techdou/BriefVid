@@ -353,6 +353,17 @@ def validate_url(url: str) -> bool:
     return bool(url and url.strip())
 
 
+def format_timestamp(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "00:00"
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, sec = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
 def parse_timestamp(ts: str) -> float | None:
     match = re.match(r"(?:(\d+):)?(\d+):(\d+)", ts)
     if match:

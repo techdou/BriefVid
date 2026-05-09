@@ -4,10 +4,9 @@ import json
 import tempfile
 from pathlib import Path
 
-from video_lecture_skill.models import KeyframeInfo, LectureNote, LectureSection
+from video_lecture_skill.models import KeyframeInfo, LectureNote, LectureSection, format_timestamp
 from video_lecture_skill.frames import (
     _find_ffmpeg,
-    _format_timestamp,
     _format_ffmpeg_seek,
     extract_keyframes_from_sections,
     extract_keyframes_from_timestamps,
@@ -44,10 +43,10 @@ def test_keyframe_info_defaults():
 
 
 def test_format_timestamp():
-    assert _format_timestamp(0) == "00:00"
-    assert _format_timestamp(65) == "01:05"
-    assert _format_timestamp(3661) == "01:01:01"
-    assert _format_timestamp(-1) == "00:00"
+    assert format_timestamp(0) == "00:00"
+    assert format_timestamp(65) == "01:05"
+    assert format_timestamp(3661) == "01:01:01"
+    assert format_timestamp(-1) == "00:00"
 
 
 def test_format_ffmpeg_seek():

@@ -5,9 +5,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from video_lecture_skill.models import KeyframeInfo, LectureNote, LectureSection
+from video_lecture_skill.models import KeyframeInfo, LectureNote, LectureSection, format_timestamp
 
 logger = logging.getLogger("video_lecture_skill.frames")
+
+
+def _sanitize_label(value: str, max_len: int = 40) -> str:
+    return "".join(c if c.isalnum() or c in "._- " else "_" for c in value)[:max_len]
 
 
 def _find_ffmpeg() -> str | None:
@@ -18,15 +22,6 @@ def _find_ffmpeg() -> str | None:
         if Path(candidate).exists():
             return candidate
     return None
-
-
-def _format_timestamp(seconds: float) -> str:
-    total = max(0, int(seconds))
-    hours, remainder = divmod(total, 3600)
-    minutes, sec = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{sec:02d}"
-    return f"{minutes:02d}:{sec:02d}"
 
 
 def _format_ffmpeg_seek(seconds: float) -> str:
@@ -128,7 +123,7 @@ def extract_keyframes_from_sections(
     keyframes: list[KeyframeInfo] = []
     for index, (ts, title) in enumerate(timestamps):
         seek_ts = max(0.0, ts + offset_seconds)
-        safe_title = "".join(c if c.isalnum() or c in "._- " else "_" for c in title)[:40]
+        safe_title = _sanitize_label(title)
         frame_filename = f"frame_{index + 1:03d}_{safe_title}.jpg"
         frame_path = out_dir / frame_filename
 
@@ -143,12 +138,12 @@ def extract_keyframes_from_sections(
         if success:
             keyframes.append(KeyframeInfo(
                 timestamp=ts,
-                timestamp_label=_format_timestamp(ts),
+                timestamp_label=format_timestamp(ts),
                 section_title=title,
                 image_path=str(frame_path),
             ))
         else:
-            logger.info("skipped keyframe for section %d (%s) at %s", index + 1, title, _format_timestamp(ts))
+            logger.info("skipped keyframe for section %d (%s) at %s", index + 1, title, format_timestamp(ts))
 
     return keyframes
 
@@ -179,7 +174,7 @@ def extract_keyframes_from_timestamps(
     for index, ts in enumerate(effective_timestamps):
         seek_ts = max(0.0, ts + offset_seconds)
         label = effective_labels[index] if effective_labels and index < len(effective_labels) else f"Frame {index + 1}"
-        safe_label = "".join(c if c.isalnum() or c in "._- " else "_" for c in label)[:40]
+        safe_label = _sanitize_label(label)
         frame_filename = f"frame_{index + 1:03d}_{safe_label}.jpg"
         frame_path = out_dir / frame_filename
 
@@ -194,7 +189,7 @@ def extract_keyframes_from_timestamps(
         if success:
             keyframes.append(KeyframeInfo(
                 timestamp=ts,
-                timestamp_label=_format_timestamp(ts),
+                timestamp_label=format_timestamp(ts),
                 section_title=label,
                 image_path=str(frame_path),
             ))

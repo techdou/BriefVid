@@ -13,6 +13,7 @@ from video_lecture_skill.models import (
     Segment,
     TranscriptionResult,
     VideoInfo,
+    format_timestamp,
 )
 
 
@@ -55,9 +56,7 @@ def export_markdown(result: PipelineResult) -> str:
         lines.append("## 讲义内容")
         lines.append("")
         for i, sec in enumerate(lecture.sections, 1):
-            minutes = int(sec.start) // 60
-            seconds = int(sec.start) % 60
-            timestamp = f"{minutes:02d}:{seconds:02d}"
+            timestamp = format_timestamp(sec.start)
             lines.append(f"### {i}. {sec.title} `[{timestamp}]`")
             lines.append("")
             keyframe = _find_keyframe_for_section(result, sec.start)
@@ -168,7 +167,7 @@ def _format_timeline(timeline: list[dict[str, object]]) -> str:
     for entry in timeline:
         title = str(entry.get("title") or "").strip() or "未命名章节"
         summary = str(entry.get("summary") or "").strip()
-        start = _format_timestamp(entry.get("start"))
+        start = format_timestamp(entry.get("start"))
         line = f"- `{start}` **{title}**"
         if summary:
             line = f"{line}: {summary}"
@@ -176,18 +175,6 @@ def _format_timeline(timeline: list[dict[str, object]]) -> str:
     if not items:
         return "- 暂无章节时间线。"
     return "\n".join(items)
-
-
-def _format_timestamp(value: object) -> str:
-    try:
-        total_seconds = max(0, int(float(value)))
-    except (TypeError, ValueError):
-        total_seconds = 0
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes:02d}:{seconds:02d}"
 
 
 def _normalize_embedded_note(markdown: str, title: str) -> str:
