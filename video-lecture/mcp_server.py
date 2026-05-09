@@ -414,6 +414,57 @@ async def get_tag_network(
 
 
 @mcp.tool()
+async def extract_keyframes(
+    task_id: str,
+    timestamps: str | None = None,
+    labels: str | None = None,
+    width: int = 1280,
+    max_frames: int = 20,
+) -> str:
+    """从已处理的视频中提取关键帧截图，用于丰富图文讲义。
+
+    基于讲义章节的时间戳自动截取视频关键帧，也可以手动指定时间点。
+    截取的帧图片会保存到任务目录的 keyframes/ 子目录下。
+    截帧后，重新导出讲义（export_obsidian 或 save_results）会自动嵌入图片。
+
+    Args:
+        task_id: 之前 process_video 返回的任务 ID
+        timestamps: 手动指定截帧时间点（秒），用逗号分隔，如 "30,120,300"。不指定则自动按章节时间戳截帧
+        labels: 对应时间点的标签，用逗号分隔，如 "开场,核心概念,总结"。仅与 timestamps 一起使用
+        width: 截帧图片宽度，默认 1280 像素
+        max_frames: 最大截帧数量，默认 20
+    """
+    service = _get_service()
+    parsed_timestamps: list[float] | None = None
+    parsed_labels: list[str] | None = None
+
+    if timestamps:
+        try:
+            parsed_timestamps = [float(t.strip()) for t in timestamps.split(",") if t.strip()]
+        except ValueError:
+            return json.dumps({"success": False, "error": "timestamps 格式错误，请使用逗号分隔的秒数，如 '30,120,300'"}, ensure_ascii=False)
+
+    if labels:
+        parsed_labels = [l.strip() for l in labels.split(",") if l.strip()]
+
+    def _run():
+        return service.extract_keyframes(
+            task_id=task_id,
+            timestamps=parsed_timestamps,
+            labels=parsed_labels,
+            width=width,
+            max_frames=max_frames,
+        )
+
+    try:
+        result = await _run_sync(_run)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": format_error_for_user(exc)}, ensure_ascii=False)
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def get_knowledge_stats() -> str:
     """获取知识库统计信息。
 

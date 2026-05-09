@@ -15,9 +15,14 @@ from video_lecture_skill.export import (
     export_to_files,
     export_transcript,
 )
+from video_lecture_skill.frames import (
+    extract_keyframes_from_sections,
+    extract_keyframes_from_timestamps,
+)
 from video_lecture_skill.knowledge import KnowledgeAgent, KnowledgeStore
 from video_lecture_skill.lecture import generate_lecture
 from video_lecture_skill.models import (
+    KeyframeInfo,
     KnowledgeAskResponse,
     KnowledgeChatHistoryItem,
     KnowledgeNetworkResponse,
@@ -407,6 +412,60 @@ class VideoLectureService:
             knowledge_llm_available=bool(self.settings.knowledge_enabled and self.settings.openai_api_key),
         )
 
+    def extract_keyframes(
+        self,
+        task_id: str,
+        timestamps: list[float] | None = None,
+        labels: list[str] | None = None,
+        width: int = 1280,
+        max_frames: int = 20,
+    ) -> dict:
+        existing = self._task_results.get(task_id)
+        if existing is None:
+            return {"success": False, "error": "未找到指定任务的结果。"}
+
+        video_path = existing.video_file_path
+        if not video_path:
+            return {"success": False, "error": "该任务没有本地视频文件，无法截帧。请确保视频已下载到本地。"}
+
+        from pathlib import Path
+        video = Path(video_path)
+        if not video.exists():
+            return {"success": False, "error": f"视频文件不存在：{video_path}"}
+
+        output_dir = self.settings.tasks_dir / task_id / "keyframes"
+
+        try:
+            if timestamps:
+                keyframes = extract_keyframes_from_timestamps(
+                    video_path=video,
+                    timestamps=timestamps,
+                    labels=labels,
+                    output_dir=output_dir,
+                    width=width,
+                    max_frames=max_frames,
+                )
+            else:
+                keyframes = extract_keyframes_from_sections(
+                    video_path=video,
+                    lecture=existing.lecture,
+                    output_dir=output_dir,
+                    width=width,
+                    max_frames=max_frames,
+                )
+
+            existing.keyframes = keyframes
+
+            return {
+                "success": True,
+                "task_id": task_id,
+                "keyframes_count": len(keyframes),
+                "keyframes": [kf.model_dump(mode="json") for kf in keyframes],
+            }
+        except Exception as exc:
+            logger.exception("extract_keyframes failed task_id=%s error=%s", task_id, exc)
+            return {"success": False, "error": format_error_for_user(exc)}
+
     def get_capabilities(self) -> dict:
         return {
             "supported_platforms": ["bilibili", "youtube", "douyin", "generic", "local"],
@@ -430,6 +489,7 @@ class VideoLectureService:
                 "resummary",
                 "local_video_upload",
                 "obsidian_export",
+                "keyframe_extraction",
             ],
             "limits": {
                 "max_video_duration_seconds": 7200,

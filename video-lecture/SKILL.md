@@ -4,9 +4,11 @@ description: >
   Convert video lectures into structured Markdown notes, Mermaid mindmaps, and Obsidian notes.
   Supports Bilibili (multi-page), YouTube, Douyin, and local video/audio files.
   Includes knowledge base RAG search & Q&A, auto-tagging, tag network visualization,
-  aggregate summary across multiple pages, resummary, and Obsidian export with YAML frontmatter.
+  aggregate summary across multiple pages, resummary, Obsidian export with YAML frontmatter,
+  and keyframe extraction for illustrated lecture notes.
   Use when the user wants to: summarize a video, generate lecture notes, create a mindmap,
-  search video knowledge, ask questions about video content, tag videos, or export to Obsidian.
+  search video knowledge, ask questions about video content, tag videos, export to Obsidian,
+  or extract key frames/screenshots from video for illustrated notes.
 license: MIT
 compatibility: Requires Python 3.11+, ffmpeg, and optional chromadb + sentence-transformers for knowledge base features.
 metadata:
@@ -104,7 +106,23 @@ export_obsidian(task_id="xxx", output_dir="/path/to/obsidian/vault")
 
 生成的笔记包含 YAML frontmatter（标题、来源、平台、标签等元数据）和结构化正文。
 
-### 8. 保存结果到文件
+### 8. 提取关键帧截图
+
+从已处理的视频中截取关键帧，用于丰富图文讲义：
+
+```
+extract_keyframes(task_id="xxx")
+```
+
+自动按讲义章节时间戳截帧。也可以手动指定时间点：
+
+```
+extract_keyframes(task_id="xxx", timestamps="30,120,300", labels="开场,核心概念,总结")
+```
+
+截帧后重新导出讲义，图片会自动嵌入到 Markdown 和 Obsidian 笔记中。
+
+### 9. 保存结果到文件
 
 ```
 save_results(url="https://...", output_dir="/path/to/output")

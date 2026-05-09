@@ -1,5 +1,6 @@
 from video_lecture_skill.models import (
     InputType,
+    KeyframeInfo,
     KnowledgeAskResponse,
     KnowledgeChatHistoryItem,
     KnowledgeNetworkLink,
@@ -46,6 +47,7 @@ __all__ = [
     "LLMError",
     "format_error_for_user",
     "InputType",
+    "KeyframeInfo",
     "KnowledgeAskResponse",
     "KnowledgeChatHistoryItem",
     "KnowledgeNetworkLink",

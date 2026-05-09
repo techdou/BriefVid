@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from video_lecture_skill.models import (
+    KeyframeInfo,
     LectureNote,
     MindmapResult,
     PipelineResult,
@@ -13,6 +14,21 @@ from video_lecture_skill.models import (
     TranscriptionResult,
     VideoInfo,
 )
+
+
+def _find_keyframe_for_section(result: PipelineResult, section_start: float) -> KeyframeInfo | None:
+    if not result.keyframes:
+        return None
+    best = None
+    best_diff = float("inf")
+    for kf in result.keyframes:
+        diff = abs(kf.timestamp - section_start)
+        if diff < best_diff:
+            best_diff = diff
+            best = kf
+    if best is not None and best_diff <= 30.0:
+        return best
+    return None
 
 
 def export_markdown(result: PipelineResult) -> str:
@@ -44,6 +60,12 @@ def export_markdown(result: PipelineResult) -> str:
             timestamp = f"{minutes:02d}:{seconds:02d}"
             lines.append(f"### {i}. {sec.title} `[{timestamp}]`")
             lines.append("")
+            keyframe = _find_keyframe_for_section(result, sec.start)
+            if keyframe:
+                img_ref = keyframe.image_path or keyframe.image_url
+                if img_ref:
+                    lines.append(f"![{sec.title}]({img_ref})")
+                    lines.append("")
             if sec.key_concepts:
                 lines.append("**核心概念：** " + "、".join(sec.key_concepts))
                 lines.append("")
@@ -189,6 +211,7 @@ def _build_markdown_body(
     key_points: list[str],
     timeline: list[dict[str, object]],
     mindmap_mermaid: str | None = None,
+    keyframes: list[KeyframeInfo] | None = None,
 ) -> str:
     sections = [
         f"# {title}",
@@ -198,9 +221,23 @@ def _build_markdown_body(
         _format_key_points(key_points),
         "## 章节时间线",
         _format_timeline(timeline),
+    ]
+    if keyframes:
+        frame_lines = ["## 关键帧截图"]
+        for kf in keyframes:
+            img_ref = kf.image_path or kf.image_url
+            if not img_ref:
+                continue
+            label = f"{kf.timestamp_label} {kf.section_title}".strip()
+            frame_lines.append(f"### {label}")
+            frame_lines.append(f"![{kf.section_title}]({img_ref})")
+            frame_lines.append("")
+        if len(frame_lines) > 1:
+            sections.extend(frame_lines)
+    sections.extend([
         "## 知识笔记",
         _normalize_embedded_note(knowledge_note_markdown, title),
-    ]
+    ])
     if mindmap_mermaid:
         sections.extend([
             "## 思维导图",
@@ -229,6 +266,7 @@ def export_obsidian(
         key_points=result.key_points,
         timeline=result.timeline,
         mindmap_mermaid=result.mindmap.mermaid or None,
+        keyframes=result.keyframes or None,
     )
     export_time = datetime.now()
     frontmatter = _build_frontmatter({

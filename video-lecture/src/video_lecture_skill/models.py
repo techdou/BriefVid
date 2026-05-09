@@ -297,6 +297,17 @@ class PipelineEvent(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class KeyframeInfo(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    timestamp: float = 0.0
+    timestamp_label: str = ""
+    section_title: str = ""
+    image_path: str = ""
+    image_url: str = ""
+    width: int = 0
+    height: int = 0
+
+
 class PipelineResult(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: str = Field(default_factory=lambda: uuid4().hex)
@@ -313,6 +324,8 @@ class PipelineResult(BaseModel):
     mindmap_status: str | None = None
     mindmap_error_message: str | None = None
     tags: list[str] = Field(default_factory=list)
+    keyframes: list[KeyframeInfo] = Field(default_factory=list)
+    video_file_path: str = ""
 
 
 class TaskRecord(BaseModel):

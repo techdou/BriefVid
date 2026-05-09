@@ -36,6 +36,7 @@ capabilities:
   - id: resummary
   - id: obsidian_export
   - id: local_video_upload
+  - id: keyframe_extraction
 parameters:
   url:
     type: string
