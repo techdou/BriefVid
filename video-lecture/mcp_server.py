@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import sys
+from datetime import datetime, timezone
 
 from mcp.server.fastmcp import FastMCP
 
@@ -33,23 +34,27 @@ mcp = FastMCP(
         "LLM 生成结构化讲义和 Mermaid 思维导图。\n\n"
         "核心功能：\n"
         "1. process_video: 处理视频，生成讲义和思维导图\n"
-        "2. resummary: 复用已有转写文本重新生成摘要\n"
-        "3. aggregate_summary: 汇总多个任务结果生成合集总结\n"
-        "4. export_obsidian: 导出为 Obsidian 格式笔记（含 frontmatter）\n"
-        "5. search_knowledge: 语义搜索知识库\n"
-        "6. ask_knowledge: 基于知识库的 RAG 问答\n"
-        "7. add_tag / remove_tag / get_tags: 标签管理\n"
-        "8. auto_tag: LLM 自动打标签\n"
-        "9. get_tag_network: 获取标签共现网络\n"
-        "10. get_knowledge_stats: 知识库统计信息\n"
-        "11. setup_check: 首次使用环境检查\n"
-        "12. get_capabilities: 查询支持的平台和功能\n\n"
+        "2. process_video_async: 异步处理视频，避免超时，配合 get_task_status 查询进度\n"
+        "3. get_task / list_tasks / delete_task: 任务管理（支持跨会话持久化）\n"
+        "4. get_task_status / cancel_task: 异步任务进度查询与取消\n"
+        "5. resummary: 复用已有转写文本重新生成摘要\n"
+        "6. aggregate_summary: 汇总多个任务结果生成合集总结\n"
+        "7. export_obsidian: 导出为 Obsidian 格式笔记\n"
+        "8. search_knowledge / ask_knowledge: 知识库搜索与 RAG 问答\n"
+        "9. add_tag / remove_tag / get_tags / auto_tag: 标签管理\n"
+        "10. get_tag_network: 标签共现网络\n"
+        "11. get_knowledge_stats: 知识库统计\n"
+        "12. get_config / set_config: 运行时配置管理\n"
+        "13. list_config_profiles / save_config_profile / switch_config_profile: 配置方案管理\n"
+        "14. setup_check: 首次使用环境检查\n"
+        "15. get_capabilities: 查询支持的平台和功能\n\n"
         "首次使用建议先调用 setup_check 确认环境就绪。\n\n"
         "注意事项：\n"
+        "- 长视频建议使用 process_video_async 异步处理，避免 MCP 调用超时\n"
+        "- 任务结果自动持久化，服务器重启后仍可通过 get_task 查询历史结果\n"
         "- 首次使用本地转写模式会下载 Whisper 模型文件\n"
         "- 需要配置 VLEC_OPENAI_API_KEY 才能使用 LLM 生成高质量讲义\n"
         "- 知识库功能需设置 VLEC_KNOWLEDGE_ENABLED=true 并安装 chromadb + sentence-transformers\n"
-        "- Obsidian 导出需设置 VLEC_OBSIDIAN_OUTPUT_DIR 或调用时指定 output_dir\n"
         "- LLM 不可用时会自动降级为本地规则生成\n\n"
         "详细文档见 references/ 目录：REFERENCE.md（技术参考）、CAPABILITIES.md（能力矩阵）、CONFIGURATION.md（配置指南）"
     ),
@@ -739,8 +744,406 @@ async def get_capabilities() -> str:
     return json.dumps(caps, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+async def get_task(task_id: str) -> str:
+    """查询指定任务的完整结果。
+
+    根据任务 ID 获取处理结果，包括讲义、思维导图、转写文本等。
+    支持跨会话查询——即使 MCP 服务器重启，只要数据目录不变，仍可获取历史任务结果。
+
+    Args:
+        task_id: 之前 process_video 返回的任务 ID
+    """
+    service = _get_service()
+    result = service.get_task(task_id)
+    if not result.get("success"):
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    output = dict(result)
+    if "lecture_md" in output:
+        output["lecture_md"] = _truncate(output["lecture_md"], 12000)
+    if "mindmap_mermaid" in output:
+        output["mindmap_mermaid"] = _truncate(output["mindmap_mermaid"], 4000)
+    if "transcript" in output:
+        output["transcript"] = _truncate(output["transcript"], 6000)
+    if "result_json" in output:
+        del output["result_json"]
+    return json.dumps(output, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def list_tasks(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """列出所有任务，支持按状态过滤。
+
+    返回任务列表，每个任务包含 task_id、状态、创建时间等摘要信息。
+    可选按状态过滤：queued（排队中）、running（运行中）、completed（已完成）、failed（失败）、cancelled（已取消）。
+
+    Args:
+        status: 按状态过滤，可选值：queued, running, completed, failed, cancelled
+        limit: 返回数量上限，默认 50
+        offset: 偏移量，默认 0
+    """
+    service = _get_service()
+    result = service.list_tasks(status=status, limit=limit, offset=offset)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def delete_task(task_id: str) -> str:
+    """删除指定任务及其结果数据。
+
+    删除后任务结果将无法恢复，请谨慎操作。
+
+    Args:
+        task_id: 要删除的任务 ID
+    """
+    service = _get_service()
+    result = service.delete_task(task_id)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def process_video_async(
+    url: str,
+    title: str | None = None,
+    language: str = "zh",
+    transcribe_mode: str | None = None,
+    page_number: int | None = None,
+) -> str:
+    """异步处理视频，立即返回任务 ID，后台执行处理流程。
+
+    适用于长视频处理场景，避免 MCP 调用超时。
+    提交后使用 get_task_status 查询进度，完成后使用 get_task 获取完整结果。
+
+    Args:
+        url: 视频链接（同 process_video 支持的格式）
+        title: 视频标题，可选
+        language: 转写语言代码，默认 zh
+        transcribe_mode: 转写模式，可选 local 或 cloud
+        page_number: B站多P视频分P号，可选
+    """
+    effective_mode = _resolve_transcribe_mode(transcribe_mode)
+    service = _make_service_with_mode(effective_mode) if effective_mode else _get_service()
+    result = service.process_async(
+        url=url, title=title, language=language, page_number=page_number,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_task_status(task_id: str) -> str:
+    """查询异步任务的执行状态和进度。
+
+    返回任务当前状态（queued/running/completed/failed/cancelled），
+    运行中的任务还会返回当前阶段和进度百分比。
+
+    Args:
+        task_id: process_video_async 返回的任务 ID
+    """
+    service = _get_service()
+    result = service.get_task_status(task_id)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def cancel_task(task_id: str) -> str:
+    """取消正在运行或排队中的异步任务。
+
+    仅对状态为 queued 或 running 的任务有效。
+
+    Args:
+        task_id: 要取消的任务 ID
+    """
+    service = _get_service()
+    result = service.cancel_task(task_id)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_config() -> str:
+    """获取当前运行时配置。
+
+    返回所有配置项的当前值，包括转写模式、LLM 设置、知识库配置等。
+    """
+    service = _get_service()
+    s = service.settings
+    return json.dumps({
+        "host": s.host,
+        "port": s.port,
+        "data_dir": str(s.data_dir),
+        "transcribe_mode": s.transcribe_mode.value,
+        "whisper_model": s.whisper_model,
+        "whisper_device": s.whisper_device,
+        "whisper_compute_type": s.whisper_compute_type,
+        "openai_base_url": s.openai_base_url,
+        "openai_model": s.openai_model,
+        "language": s.language,
+        "output_formats": s.output_format_list,
+        "summary_chunk_target_chars": s.summary_chunk_target_chars,
+        "summary_chunk_concurrency": s.summary_chunk_concurrency,
+        "knowledge_enabled": s.knowledge_enabled,
+        "knowledge_embedding_model": s.knowledge_embedding_model,
+        "obsidian_output_dir": s.obsidian_output_dir,
+        "export_target": s.export_target,
+        "active_profile": getattr(s, "_active_profile", "default"),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def set_config(
+    transcribe_mode: str | None = None,
+    whisper_model: str | None = None,
+    whisper_device: str | None = None,
+    whisper_compute_type: str | None = None,
+    openai_base_url: str | None = None,
+    openai_model: str | None = None,
+    language: str | None = None,
+    output_formats: str | None = None,
+    summary_chunk_target_chars: int | None = None,
+    summary_chunk_concurrency: int | None = None,
+    knowledge_enabled: bool | None = None,
+    obsidian_output_dir: str | None = None,
+) -> str:
+    """运行时修改配置，无需重启 MCP 服务器。
+
+    仅需传入要修改的配置项，未传入的配置项保持不变。
+    修改后立即生效，影响后续所有任务处理。
+
+    Args:
+        transcribe_mode: 转写模式，local 或 cloud
+        whisper_model: Whisper 模型名称，如 base, small, medium, large
+        whisper_device: 推理设备，cpu 或 cuda
+        whisper_compute_type: 计算精度，如 int8, float16
+        openai_base_url: OpenAI API 基础 URL
+        openai_model: LLM 模型名称
+        language: 默认转写语言
+        output_formats: 输出格式，逗号分隔，如 "markdown,mermaid,json"
+        summary_chunk_target_chars: 摘要分块目标字符数
+        summary_chunk_concurrency: 摘要分块并发数
+        knowledge_enabled: 是否启用知识库
+        obsidian_output_dir: Obsidian 输出目录
+    """
+    global _service, _settings
+    service = _get_service()
+    s = service.settings
+
+    updates: dict = {}
+    if transcribe_mode is not None:
+        resolved = _resolve_transcribe_mode(transcribe_mode)
+        if resolved:
+            updates["transcribe_mode"] = resolved
+    if whisper_model is not None:
+        updates["whisper_model"] = whisper_model
+    if whisper_device is not None:
+        updates["whisper_device"] = whisper_device
+    if whisper_compute_type is not None:
+        updates["whisper_compute_type"] = whisper_compute_type
+    if openai_base_url is not None:
+        updates["openai_base_url"] = openai_base_url
+    if openai_model is not None:
+        updates["openai_model"] = openai_model
+    if language is not None:
+        updates["language"] = language
+    if output_formats is not None:
+        updates["output_formats"] = output_formats
+    if summary_chunk_target_chars is not None:
+        updates["summary_chunk_target_chars"] = summary_chunk_target_chars
+    if summary_chunk_concurrency is not None:
+        updates["summary_chunk_concurrency"] = summary_chunk_concurrency
+    if knowledge_enabled is not None:
+        updates["knowledge_enabled"] = knowledge_enabled
+    if obsidian_output_dir is not None:
+        updates["obsidian_output_dir"] = obsidian_output_dir
+
+    if not updates:
+        return json.dumps({"success": False, "error": "未指定任何配置项"}, ensure_ascii=False)
+
+    new_settings = s.model_copy(update=updates)
+    new_settings.ensure_dirs()
+
+    old_store = service._task_store
+    _settings = new_settings
+    _service = VideoLectureService(new_settings)
+    _service._task_store = old_store
+    _service._running_tasks = service._running_tasks
+    _service._cancel_events = service._cancel_events
+
+    return json.dumps({
+        "success": True,
+        "updated_keys": list(updates.keys()),
+        "message": "配置已更新并立即生效",
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def list_config_profiles() -> str:
+    """列出所有可用的配置方案（profiles）。
+
+    配置方案允许保存和切换不同的配置组合，例如不同的 LLM 模型、
+    不同的转写模式等。默认方案为 "default"。
+    """
+    service = _get_service()
+    profiles_dir = service.settings.data_dir / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    profiles: list[dict] = []
+    for fp in sorted(profiles_dir.glob("*.json")):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            profiles.append({
+                "name": fp.stem,
+                "updated_at": data.get("_updated_at", ""),
+                "keys": [k for k in data.keys() if not k.startswith("_")],
+            })
+        except Exception:
+            profiles.append({"name": fp.stem, "error": "无法读取"})
+
+    active = getattr(service.settings, "_active_profile", "default")
+    return json.dumps({
+        "success": True,
+        "active_profile": active,
+        "profiles": profiles,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def save_config_profile(
+    name: str,
+    transcribe_mode: str | None = None,
+    whisper_model: str | None = None,
+    whisper_device: str | None = None,
+    openai_base_url: str | None = None,
+    openai_model: str | None = None,
+    language: str | None = None,
+    output_formats: str | None = None,
+    knowledge_enabled: bool | None = None,
+    obsidian_output_dir: str | None = None,
+) -> str:
+    """保存当前配置为命名方案，方便后续快速切换。
+
+    Args:
+        name: 方案名称，如 "cloud_mode"、"fast_mode"
+        transcribe_mode: 转写模式覆盖，可选
+        whisper_model: Whisper 模型覆盖，可选
+        whisper_device: 推理设备覆盖，可选
+        openai_base_url: API URL 覆盖，可选
+        openai_model: LLM 模型覆盖，可选
+        language: 默认语言覆盖，可选
+        output_formats: 输出格式覆盖，可选
+        knowledge_enabled: 知识库开关覆盖，可选
+        obsidian_output_dir: Obsidian 目录覆盖，可选
+    """
+    service = _get_service()
+    s = service.settings
+    profiles_dir = s.data_dir / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    profile_data: dict = {"_updated_at": datetime.now(timezone.utc).isoformat()}
+    base_config = {
+        "transcribe_mode": transcribe_mode or s.transcribe_mode.value,
+        "whisper_model": whisper_model or s.whisper_model,
+        "whisper_device": whisper_device or s.whisper_device,
+        "openai_base_url": openai_base_url or s.openai_base_url,
+        "openai_model": openai_model or s.openai_model,
+        "language": language or s.language,
+        "output_formats": output_formats or s.output_formats,
+        "knowledge_enabled": knowledge_enabled if knowledge_enabled is not None else s.knowledge_enabled,
+        "obsidian_output_dir": obsidian_output_dir or s.obsidian_output_dir,
+    }
+    profile_data.update(base_config)
+
+    safe_name = "".join(c for c in name if c.isalnum() or c in ("_", "-")).strip()
+    if not safe_name:
+        return json.dumps({"success": False, "error": "方案名称无效"}, ensure_ascii=False)
+
+    profile_path = profiles_dir / f"{safe_name}.json"
+    profile_path.write_text(json.dumps(profile_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return json.dumps({
+        "success": True,
+        "profile_name": safe_name,
+        "path": str(profile_path),
+        "config_keys": list(base_config.keys()),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def switch_config_profile(name: str) -> str:
+    """切换到已保存的配置方案。
+
+    切换后配置立即生效，影响后续所有任务处理。
+    使用 list_config_profiles 查看可用方案。
+
+    Args:
+        name: 方案名称
+    """
+    global _service, _settings
+    service = _get_service()
+    profiles_dir = service.settings.data_dir / "profiles"
+    profile_path = profiles_dir / f"{name}.json"
+
+    if not profile_path.exists():
+        return json.dumps({
+            "success": False,
+            "error": f"配置方案 '{name}' 不存在，使用 list_config_profiles 查看可用方案",
+        }, ensure_ascii=False)
+
+    try:
+        profile_data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return json.dumps({"success": False, "error": f"读取方案失败: {exc}"}, ensure_ascii=False)
+
+    updates: dict = {}
+    field_map = {
+        "transcribe_mode": "transcribe_mode",
+        "whisper_model": "whisper_model",
+        "whisper_device": "whisper_device",
+        "openai_base_url": "openai_base_url",
+        "openai_model": "openai_model",
+        "language": "language",
+        "output_formats": "output_formats",
+        "knowledge_enabled": "knowledge_enabled",
+        "obsidian_output_dir": "obsidian_output_dir",
+    }
+    for profile_key, settings_key in field_map.items():
+        if profile_key in profile_data:
+            val = profile_data[profile_key]
+            if settings_key == "transcribe_mode":
+                resolved = _resolve_transcribe_mode(val)
+                if resolved:
+                    updates[settings_key] = resolved
+            elif settings_key == "knowledge_enabled":
+                updates[settings_key] = bool(val)
+            else:
+                updates[settings_key] = val
+
+    if not updates:
+        return json.dumps({"success": False, "error": "方案中没有有效的配置项"}, ensure_ascii=False)
+
+    new_settings = service.settings.model_copy(update=updates)
+    new_settings.ensure_dirs()
+    setattr(new_settings, "_active_profile", name)
+
+    old_store = service._task_store
+    _settings = new_settings
+    _service = VideoLectureService(new_settings)
+    _service._task_store = old_store
+    _service._running_tasks = service._running_tasks
+    _service._cancel_events = service._cancel_events
+
+    return json.dumps({
+        "success": True,
+        "active_profile": name,
+        "applied_keys": list(updates.keys()),
+        "message": f"已切换到方案 '{name}'，配置立即生效",
+    }, ensure_ascii=False, indent=2)
+
+
 @mcp.resource("video-lecture://config")
-def get_config() -> str:
+def config_resource() -> str:
     """获取当前 video-lecture-skill 的配置信息。"""
     service = _get_service()
     s = service.settings
@@ -759,6 +1162,7 @@ def get_config() -> str:
         "knowledge_embedding_model": s.knowledge_embedding_model,
         "obsidian_output_dir": s.obsidian_output_dir,
         "export_target": s.export_target,
+        "active_profile": getattr(s, "_active_profile", "default"),
     }, ensure_ascii=False, indent=2)
 
 

@@ -252,9 +252,9 @@ async def test_save_results_success():
 
 
 def test_get_config_resource():
-    from mcp_server import get_config, _reset_service
+    from mcp_server import config_resource, _reset_service
     _reset_service()
-    result = get_config()
+    result = config_resource()
     data = json.loads(result)
     assert "transcribe_mode" in data
     assert "whisper_model" in data

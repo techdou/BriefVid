@@ -198,12 +198,12 @@ def test_service_extract_keyframes_no_video_file():
     from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo, TranscriptionResult, MindmapResult
     settings = SkillSettings()
     service = VideoLectureService(settings)
-    service._task_results["t1"] = PipelineResult(
+    service._task_store.save("t1", PipelineResult(
         video_info=VideoInfo(title="测试"),
         lecture=LectureNote(title="测试讲义"),
         transcription=TranscriptionResult(transcript="转写"),
         mindmap=MindmapResult(),
-    )
+    ))
     result = service.extract_keyframes("t1")
     assert result["success"] is False
     assert "视频文件" in result["error"]

@@ -30,6 +30,7 @@ from video_lecture_skill.models import (
 )
 from video_lecture_skill.service import VideoLectureService, run_sync
 from video_lecture_skill.config import SkillSettings
+from video_lecture_skill.task_store import TaskStore
 from video_lecture_skill.errors import (
     VideoLectureError,
     DownloadError,
@@ -42,6 +43,7 @@ __all__ = [
     "VideoLectureService",
     "run_sync",
     "SkillSettings",
+    "TaskStore",
     "VideoLectureError",
     "DownloadError",
     "TranscribeError",

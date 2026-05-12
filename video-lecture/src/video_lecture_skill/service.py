@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 from pathlib import Path
 from typing import Callable
 from uuid import uuid4
@@ -35,6 +36,8 @@ from video_lecture_skill.models import (
     PipelineResult,
     Segment,
     TaskInput,
+    TaskRecord,
+    TaskStatus,
     TagItem,
     TranscriptionResult,
     VideoInfo,
@@ -42,6 +45,7 @@ from video_lecture_skill.models import (
 )
 from video_lecture_skill.mindmap import generate_mindmap
 from video_lecture_skill.tags import TagStore
+from video_lecture_skill.task_store import TaskStore
 from video_lecture_skill.transcribe import transcribe_audio
 
 logger = logging.getLogger("video_lecture_skill.service")
@@ -56,7 +60,9 @@ class VideoLectureService:
         self._knowledge_store: KnowledgeStore | None = None
         self._tag_store: TagStore | None = None
         self._knowledge_agent: KnowledgeAgent | None = None
-        self._task_results: dict[str, PipelineResult] = {}
+        self._task_store = TaskStore(self.settings.tasks_dir, max_tasks=self.MAX_TASK_RESULTS)
+        self._running_tasks: dict[str, dict] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
 
     @property
     def knowledge_store(self) -> KnowledgeStore:
@@ -109,8 +115,15 @@ class VideoLectureService:
             )
 
             video_id = result.video_info.canonical_id or result.video_info.id
-            self._task_results[task_id] = result
-            self._evict_old_tasks()
+            self._task_store.save(task_id, result)
+            self._task_store.save_record(task_id, TaskRecord(
+                task_id=task_id,
+                task_input=task_input,
+                status=TaskStatus.COMPLETED,
+                result=result,
+                video_id=video_id,
+                page_number=page_number,
+            ))
 
             if self.settings.knowledge_enabled:
                 self.knowledge_store.register_result(video_id, result)
@@ -252,8 +265,14 @@ class VideoLectureService:
                 video_file_path=video_file_path,
             )
 
-            self._task_results[task_id] = result
-            self._evict_old_tasks()
+            self._task_store.save(task_id, result)
+            self._task_store.save_record(task_id, TaskRecord(
+                task_id=task_id,
+                task_input=TaskInput(url=f"file://{local_path}", title=effective_title, language=language),
+                status=TaskStatus.COMPLETED,
+                result=result,
+                video_id=video_info.id,
+            ))
 
             if output_dir:
                 artifacts = export_to_files(result, Path(output_dir))
@@ -282,7 +301,7 @@ class VideoLectureService:
         self,
         task_id: str,
     ) -> dict:
-        existing = self._task_results.get(task_id)
+        existing = self._task_store.get(task_id)
         if existing is None:
             return {
                 "success": False,
@@ -323,7 +342,14 @@ class VideoLectureService:
                 "lecture": lecture,
                 "mindmap": mindmap,
             })
-            self._task_results[new_task_id] = new_result
+            self._task_store.save(new_task_id, new_result)
+            self._task_store.save_record(new_task_id, TaskRecord(
+                task_id=new_task_id,
+                task_input=TaskInput(url=existing.video_info.url, title=title),
+                status=TaskStatus.COMPLETED,
+                result=new_result,
+                video_id=video_id,
+            ))
 
             video_id = existing.video_info.canonical_id or existing.video_info.id
             if self.settings.knowledge_enabled:
@@ -354,7 +380,7 @@ class VideoLectureService:
     ) -> dict:
         source_results: list[tuple[str, PipelineResult]] = []
         for tid in task_ids:
-            result = self._task_results.get(tid)
+            result = self._task_store.get(tid)
             if result is not None:
                 source_results.append((tid, result))
 
@@ -428,7 +454,13 @@ class VideoLectureService:
             )
 
             new_task_id = uuid4().hex
-            self._task_results[new_task_id] = aggregate_result
+            self._task_store.save(new_task_id, aggregate_result)
+            self._task_store.save_record(new_task_id, TaskRecord(
+                task_id=new_task_id,
+                task_input=TaskInput(url="", title=aggregate_title),
+                status=TaskStatus.COMPLETED,
+                result=aggregate_result,
+            ))
 
             return {
                 "success": True,
@@ -452,7 +484,7 @@ class VideoLectureService:
         task_id: str,
         output_dir: str | None = None,
     ) -> dict:
-        result = self._task_results.get(task_id)
+        result = self._task_store.get(task_id)
         if result is None:
             return {"success": False, "error": "未找到指定任务的结果。"}
 
@@ -540,10 +572,11 @@ class VideoLectureService:
         tagged_video_ids: set[str] = set()
         for record in self.tag_store.get_all_video_tags():
             tagged_video_ids.add(record.video_id)
-        untagged_count = max(0, len(self._task_results) - len(tagged_video_ids & set(self._task_results.keys())))
+        all_task_ids = set(self._task_store.list_all_ids())
+        untagged_count = max(0, len(all_task_ids) - len(tagged_video_ids & all_task_ids))
 
         return KnowledgeStatsResponse(
-            video_count=len(self._task_results),
+            video_count=len(all_task_ids),
             indexed_chunk_count=indexed_chunk_count,
             tag_count=len(all_tags),
             untagged_video_count=untagged_count,
@@ -558,7 +591,7 @@ class VideoLectureService:
         width: int = 1280,
         max_frames: int = 20,
     ) -> dict:
-        existing = self._task_results.get(task_id)
+        existing = self._task_store.get(task_id)
         if existing is None:
             return {"success": False, "error": "未找到指定任务的结果。"}
 
@@ -592,7 +625,7 @@ class VideoLectureService:
                 )
 
             updated = existing.model_copy(update={"keyframes": keyframes})
-            self._task_results[task_id] = updated
+            self._task_store.save(task_id, updated)
 
             return {
                 "success": True,
@@ -604,12 +637,177 @@ class VideoLectureService:
             logger.exception("extract_keyframes failed task_id=%s error=%s", task_id, exc)
             return {"success": False, "error": format_error_for_user(exc)}
 
-    def _evict_old_tasks(self) -> None:
-        if len(self._task_results) <= self.MAX_TASK_RESULTS:
-            return
-        oldest_keys = list(self._task_results.keys())[: len(self._task_results) - self.MAX_TASK_RESULTS]
-        for key in oldest_keys:
-            self._task_results.pop(key, None)
+    def get_task(self, task_id: str) -> dict:
+        result = self._task_store.get(task_id)
+        record = self._task_store.get_record(task_id)
+        if result is None and record is None:
+            return {"success": False, "error": f"未找到任务 {task_id}"}
+        response: dict = {"success": True, "task_id": task_id}
+        if record is not None:
+            response["status"] = record.status.value
+            response["video_id"] = record.video_id
+            response["created_at"] = record.created_at.isoformat()
+            response["updated_at"] = record.updated_at.isoformat()
+            if record.error_message:
+                response["error_message"] = record.error_message
+        else:
+            response["status"] = "completed"
+        if result is not None:
+            response["lecture_title"] = result.lecture.title
+            response["sections_count"] = len(result.lecture.sections)
+            response["transcript_chars"] = len(result.transcription.transcript)
+            response["lecture_md"] = export_markdown(result)
+            response["mindmap_mermaid"] = export_mermaid(result)
+            response["transcript"] = export_transcript(result)
+            response["result_json"] = export_json(result)
+            response["artifacts"] = result.artifacts
+        return response
+
+    def list_tasks(
+        self,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        task_status = None
+        if status:
+            try:
+                task_status = TaskStatus(status)
+            except ValueError:
+                return {"success": False, "error": f"无效的状态值: {status}"}
+        records = self._task_store.list_tasks(status=task_status, limit=limit, offset=offset)
+        items = []
+        for r in records:
+            item: dict = {
+                "task_id": r.task_id,
+                "status": r.status.value,
+                "created_at": r.created_at.isoformat(),
+                "updated_at": r.updated_at.isoformat(),
+            }
+            if r.video_id:
+                item["video_id"] = r.video_id
+            if r.error_message:
+                item["error_message"] = r.error_message
+            if r.result is not None:
+                item["lecture_title"] = r.result.lecture.title
+                item["sections_count"] = len(r.result.lecture.sections)
+            items.append(item)
+        return {"success": True, "tasks": items, "count": len(items)}
+
+    def delete_task(self, task_id: str) -> dict:
+        removed = self._task_store.delete(task_id)
+        if removed:
+            return {"success": True, "task_id": task_id, "deleted": True}
+        return {"success": False, "error": f"未找到任务 {task_id}"}
+
+    def process_async(
+        self,
+        url: str,
+        title: str | None = None,
+        language: str = "zh",
+        page_number: int | None = None,
+    ) -> dict:
+        task_id = uuid4().hex
+        task_input = TaskInput(url=url, title=title, language=language, page_number=page_number)
+
+        record = TaskRecord(
+            task_id=task_id,
+            task_input=task_input,
+            status=TaskStatus.QUEUED,
+            page_number=page_number,
+        )
+        self._task_store.save_record(task_id, record)
+
+        cancel_event = threading.Event()
+        self._cancel_events[task_id] = cancel_event
+
+        def _worker() -> None:
+            self._task_store.update_record_status(task_id, TaskStatus.RUNNING)
+            self._running_tasks[task_id] = {"stage": "starting", "progress": 0}
+
+            def on_event(event: PipelineEvent) -> None:
+                self._running_tasks[task_id] = {
+                    "stage": event.stage,
+                    "progress": event.progress,
+                    "message": event.message,
+                }
+
+            try:
+                result = run_sync(
+                    task_input=task_input,
+                    settings=self.settings,
+                    emit=on_event,
+                )
+                video_id = result.video_info.canonical_id or result.video_info.id
+                self._task_store.save(task_id, result)
+                self._task_store.update_record_status(
+                    task_id, TaskStatus.COMPLETED, result=result
+                )
+                if self.settings.knowledge_enabled:
+                    try:
+                        self.knowledge_store.register_result(video_id, result)
+                        self.knowledge_store.index_video(video_id)
+                    except Exception as exc:
+                        logger.warning("knowledge indexing failed for %s: %s", task_id, exc)
+            except Exception as exc:
+                logger.exception("async task %s failed: %s", task_id, exc)
+                self._task_store.update_record_status(
+                    task_id, TaskStatus.FAILED, error_message=str(exc)
+                )
+            finally:
+                self._running_tasks.pop(task_id, None)
+                self._cancel_events.pop(task_id, None)
+
+        thread = threading.Thread(target=_worker, daemon=True, name=f"task-{task_id[:8]}")
+        thread.start()
+
+        return {
+            "success": True,
+            "task_id": task_id,
+            "status": "queued",
+            "message": "任务已提交，使用 get_task_status 查询进度",
+        }
+
+    def get_task_status(self, task_id: str) -> dict:
+        record = self._task_store.get_record(task_id)
+        if record is None:
+            return {"success": False, "error": f"未找到任务 {task_id}"}
+
+        response: dict = {
+            "success": True,
+            "task_id": task_id,
+            "status": record.status.value,
+            "created_at": record.created_at.isoformat(),
+            "updated_at": record.updated_at.isoformat(),
+        }
+
+        if record.status == TaskStatus.RUNNING:
+            progress_info = self._running_tasks.get(task_id, {})
+            response["stage"] = progress_info.get("stage", "unknown")
+            response["progress"] = progress_info.get("progress", 0)
+            response["message"] = progress_info.get("message", "")
+
+        if record.status == TaskStatus.COMPLETED and record.result is not None:
+            response["lecture_title"] = record.result.lecture.title
+            response["sections_count"] = len(record.result.lecture.sections)
+
+        if record.error_message:
+            response["error_message"] = record.error_message
+
+        return response
+
+    def cancel_task(self, task_id: str) -> dict:
+        record = self._task_store.get_record(task_id)
+        if record is None:
+            return {"success": False, "error": f"未找到任务 {task_id}"}
+        if record.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+            return {"success": False, "error": f"任务状态为 {record.status.value}，无法取消"}
+        cancel_event = self._cancel_events.get(task_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        self._task_store.update_record_status(task_id, TaskStatus.CANCELLED)
+        self._running_tasks.pop(task_id, None)
+        return {"success": True, "task_id": task_id, "status": "cancelled"}
 
     def get_capabilities(self) -> dict:
         return {
@@ -635,6 +833,11 @@ class VideoLectureService:
                 "local_video_upload",
                 "obsidian_export",
                 "keyframe_extraction",
+                "task_persistence",
+                "async_processing",
+                "task_management",
+                "config_management",
+                "config_profiles",
             ],
             "limits": {
                 "max_video_duration_seconds": 7200,

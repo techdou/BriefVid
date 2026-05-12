@@ -5,14 +5,15 @@ description: >
   Supports Bilibili (multi-page), YouTube, Douyin, and local video/audio files.
   Includes knowledge base RAG search & Q&A, auto-tagging, tag network visualization,
   aggregate summary across multiple pages, resummary, Obsidian export with YAML frontmatter,
-  and keyframe extraction for illustrated lecture notes.
+  keyframe extraction for illustrated lecture notes, task persistence across sessions,
+  async processing with progress tracking, and runtime config management with profiles.
   Use when the user wants to: summarize a video, generate lecture notes, create a mindmap,
   search video knowledge, ask questions about video content, tag videos, export to Obsidian,
-  or extract key frames/screenshots from video for illustrated notes.
+  extract key frames, manage tasks, check async progress, or adjust runtime configuration.
 license: MIT
 compatibility: Requires Python 3.11+, ffmpeg, and optional chromadb + sentence-transformers for knowledge base features.
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
   author: community
   api_version: "v2"
   entry_point: "video_lecture_skill.api:app"
@@ -38,6 +39,9 @@ allowed-tools: Bash(python:*) Bash(ffmpeg:*) Bash(yt-dlp:*) Read Write
 - 处理 B 站多 P 视频，生成合集总结
 - 重新生成已有视频的摘要（重摘要）
 - 处理本地视频或音频文件
+- 异步处理长视频并查询进度
+- 查询、列出或删除历史任务
+- 运行时修改配置或切换配置方案
 
 ## Instructions
 
@@ -129,6 +133,38 @@ save_results(url="https://...", output_dir="/path/to/output")
 ```
 
 会在指定目录生成 transcript.txt、lecture.md、mindmap.mmd、result.json。
+
+### 10. 异步处理长视频
+
+对于长视频（>30 分钟），建议使用异步处理避免 MCP 调用超时：
+
+```
+process_video_async(url="https://...")
+```
+
+提交后立即返回 task_id，使用以下工具查询进度：
+
+- `get_task_status(task_id="xxx")` — 查询状态和进度百分比
+- `cancel_task(task_id="xxx")` — 取消运行中的任务
+- `get_task(task_id="xxx")` — 完成后获取完整结果
+
+### 11. 任务管理
+
+任务结果自动持久化到磁盘，MCP 服务器重启后仍可查询：
+
+- `get_task(task_id="xxx")` — 查询指定任务的完整结果
+- `list_tasks(status="completed")` — 列出任务，支持按状态过滤
+- `delete_task(task_id="xxx")` — 删除任务及其数据
+
+### 12. 运行时配置管理
+
+无需重启 MCP 服务器即可修改配置：
+
+- `get_config()` — 查看当前配置
+- `set_config(openai_model="gpt-4o", language="en")` — 修改指定配置项
+- `save_config_profile(name="fast_mode", transcribe_mode="cloud")` — 保存配置方案
+- `list_config_profiles()` — 列出所有配置方案
+- `switch_config_profile(name="fast_mode")` — 切换配置方案
 
 ## Edge Cases
 

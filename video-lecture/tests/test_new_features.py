@@ -319,11 +319,13 @@ def test_service_tag_operations():
 
 
 def test_service_knowledge_stats():
-    settings = SkillSettings()
-    service = VideoLectureService(settings)
-    stats = service.get_knowledge_stats()
-    assert stats.video_count == 0
-    assert stats.tag_count == 0
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        service = VideoLectureService(settings)
+        stats = service.get_knowledge_stats()
+        assert stats.video_count == 0
+        assert stats.tag_count == 0
 
 
 def test_service_resummary_no_task():
@@ -353,12 +355,12 @@ def test_service_export_obsidian_no_output_dir():
     from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo, TranscriptionResult, MindmapResult
     settings = SkillSettings(obsidian_output_dir="")
     service = VideoLectureService(settings)
-    service._task_results["t1"] = PipelineResult(
+    service._task_store.save("t1", PipelineResult(
         video_info=VideoInfo(title="测试"),
         lecture=LectureNote(title="测试讲义"),
         transcription=TranscriptionResult(transcript="转写"),
         mindmap=MindmapResult(),
-    )
+    ))
     result = service.export_obsidian_note("t1")
     assert result["success"] is False
     assert "Obsidian" in result["error"]
@@ -454,3 +456,186 @@ def test_task_input_new_fields():
     assert task.input_type == InputType.URL
     assert task.page_number == 3
     assert task.source_transcript == "之前的转写文本"
+
+
+def test_task_store_save_and_load():
+    import tempfile
+    from video_lecture_skill.task_store import TaskStore
+    from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo, TranscriptionResult, MindmapResult
+    with tempfile.TemporaryDirectory() as tmp:
+        tasks_dir = Path(tmp) / "tasks"
+        tasks_dir.mkdir()
+        store = TaskStore(tasks_dir)
+        result = PipelineResult(
+            video_info=VideoInfo(title="持久化测试"),
+            lecture=LectureNote(title="测试讲义"),
+            transcription=TranscriptionResult(transcript="转写内容"),
+            mindmap=MindmapResult(),
+        )
+        store.save("task_persist_1", result)
+        loaded = store.get("task_persist_1")
+        assert loaded is not None
+        assert loaded.lecture.title == "测试讲义"
+        assert loaded.transcription.transcript == "转写内容"
+
+
+def test_task_store_persistence_across_instances():
+    import tempfile
+    from video_lecture_skill.task_store import TaskStore
+    from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo
+    with tempfile.TemporaryDirectory() as tmp:
+        tasks_dir = Path(tmp) / "tasks"
+        tasks_dir.mkdir()
+        store1 = TaskStore(tasks_dir)
+        result = PipelineResult(
+            video_info=VideoInfo(title="跨实例测试"),
+            lecture=LectureNote(title="跨实例讲义"),
+        )
+        store1.save("cross_inst_1", result)
+        del store1
+        store2 = TaskStore(tasks_dir)
+        loaded = store2.get("cross_inst_1")
+        assert loaded is not None
+        assert loaded.video_info.title == "跨实例测试"
+
+
+def test_task_store_delete():
+    import tempfile
+    from video_lecture_skill.task_store import TaskStore
+    from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo
+    with tempfile.TemporaryDirectory() as tmp:
+        tasks_dir = Path(tmp) / "tasks"
+        tasks_dir.mkdir()
+        store = TaskStore(tasks_dir)
+        store.save("del_1", PipelineResult(video_info=VideoInfo(title="删除测试")))
+        assert store.get("del_1") is not None
+        assert store.delete("del_1") is True
+        assert store.get("del_1") is None
+        assert store.delete("nonexistent") is False
+
+
+def test_task_store_list_tasks():
+    import tempfile
+    from video_lecture_skill.task_store import TaskStore
+    from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo, TaskRecord, TaskInput, TaskStatus
+    with tempfile.TemporaryDirectory() as tmp:
+        tasks_dir = Path(tmp) / "tasks"
+        tasks_dir.mkdir()
+        store = TaskStore(tasks_dir)
+        store.save("list_1", PipelineResult(video_info=VideoInfo(title="任务1")))
+        store.save_record("list_1", TaskRecord(
+            task_id="list_1", task_input=TaskInput(url="https://example.com/1"), status=TaskStatus.COMPLETED,
+        ))
+        store.save("list_2", PipelineResult(video_info=VideoInfo(title="任务2")))
+        store.save_record("list_2", TaskRecord(
+            task_id="list_2", task_input=TaskInput(url="https://example.com/2"), status=TaskStatus.FAILED,
+        ))
+        all_tasks = store.list_tasks()
+        assert len(all_tasks) == 2
+        completed = store.list_tasks(status=TaskStatus.COMPLETED)
+        assert len(completed) == 1
+        assert completed[0].task_id == "list_1"
+
+
+def test_service_get_task():
+    import tempfile
+    from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo, TranscriptionResult, MindmapResult
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        service = VideoLectureService(settings)
+        result = PipelineResult(
+            video_info=VideoInfo(title="查询测试"),
+            lecture=LectureNote(title="查询讲义"),
+            transcription=TranscriptionResult(transcript="转写"),
+            mindmap=MindmapResult(),
+        )
+        service._task_store.save("query_1", result)
+        got = service.get_task("query_1")
+        assert got["success"] is True
+        assert got["lecture_title"] == "查询讲义"
+        got_missing = service.get_task("nonexistent")
+        assert got_missing["success"] is False
+
+
+def test_service_list_and_delete_tasks():
+    import tempfile
+    from video_lecture_skill.models import PipelineResult, LectureNote, VideoInfo, TaskRecord, TaskInput, TaskStatus
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        service = VideoLectureService(settings)
+        service._task_store.save("mgmt_1", PipelineResult(video_info=VideoInfo(title="管理1")))
+        service._task_store.save_record("mgmt_1", TaskRecord(
+            task_id="mgmt_1", task_input=TaskInput(url="https://example.com"), status=TaskStatus.COMPLETED,
+        ))
+        listed = service.list_tasks()
+        assert listed["success"] is True
+        assert listed["count"] == 1
+        deleted = service.delete_task("mgmt_1")
+        assert deleted["success"] is True
+        assert service.list_tasks()["count"] == 0
+
+
+def test_service_process_async_and_status():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        service = VideoLectureService(settings)
+        result = service.process_async(url="https://example.com/fake")
+        assert result["success"] is True
+        assert result["status"] == "queued"
+        task_id = result["task_id"]
+        status = service.get_task_status(task_id)
+        assert status["success"] is True
+        assert status["task_id"] == task_id
+        missing = service.get_task_status("nonexistent")
+        assert missing["success"] is False
+
+
+def test_service_cancel_task():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        service = VideoLectureService(settings)
+        cancel_nonexistent = service.cancel_task("nonexistent")
+        assert cancel_nonexistent["success"] is False
+        result = service.process_async(url="https://example.com/fake")
+        task_id = result["task_id"]
+        import time
+        time.sleep(0.1)
+        cancel_result = service.cancel_task(task_id)
+        assert cancel_result["success"] is True
+        assert cancel_result["status"] == "cancelled"
+
+
+def test_config_management_get_and_set():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        service = VideoLectureService(settings)
+        assert service.settings.openai_model == "gpt-4o-mini"
+        assert service.settings.language == "zh"
+        new_settings = service.settings.model_copy(update={"openai_model": "gpt-4o", "language": "en"})
+        new_settings.ensure_dirs()
+        assert new_settings.openai_model == "gpt-4o"
+        assert new_settings.language == "en"
+
+
+def test_config_profiles_save_and_switch():
+    import tempfile
+    from video_lecture_skill.config import SkillSettings
+    with tempfile.TemporaryDirectory() as tmp:
+        settings = SkillSettings(data_dir=Path(tmp))
+        profiles_dir = settings.data_dir / "profiles"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        profile_data = {
+            "_updated_at": "2026-01-01T00:00:00",
+            "transcribe_mode": "cloud",
+            "whisper_model": "large",
+            "openai_model": "gpt-4o",
+            "language": "en",
+        }
+        profile_path = profiles_dir / "test_profile.json"
+        profile_path.write_text(json.dumps(profile_data), encoding="utf-8")
+        loaded = json.loads(profile_path.read_text(encoding="utf-8"))
+        assert loaded["openai_model"] == "gpt-4o"
+        assert loaded["language"] == "en"

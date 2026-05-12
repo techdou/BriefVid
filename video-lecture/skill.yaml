@@ -1,5 +1,5 @@
 name: video-lecture
-version: 0.2.0
+version: 0.3.0
 api_version: "v2"
 entry_point: video_lecture_skill.api:app
 cli_entry: video_lecture_skill.cli:main
@@ -37,6 +37,11 @@ capabilities:
   - id: obsidian_export
   - id: local_video_upload
   - id: keyframe_extraction
+  - id: task_persistence
+  - id: async_processing
+  - id: task_management
+  - id: config_management
+  - id: config_profiles
 parameters:
   url:
     type: string
