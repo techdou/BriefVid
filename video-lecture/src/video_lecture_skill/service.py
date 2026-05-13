@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from video_lecture_skill.config import SkillSettings
 from video_lecture_skill.download import download_audio, download_video, normalize_video_url
-from video_lecture_skill.errors import format_error_for_user
+from video_lecture_skill.errors import format_error_for_user, TaskCancelledError
 from video_lecture_skill.export import (
     export_json,
     export_markdown,
@@ -63,6 +63,7 @@ class VideoLectureService:
         self._task_store = TaskStore(self.settings.tasks_dir, max_tasks=self.MAX_TASK_RESULTS)
         self._running_tasks: dict[str, dict] = {}
         self._cancel_events: dict[str, threading.Event] = {}
+        self._state_lock = threading.Lock()
 
     @property
     def knowledge_store(self) -> KnowledgeStore:
@@ -151,6 +152,13 @@ class VideoLectureService:
 
         except Exception as exc:
             logger.exception("process failed task_id=%s error=%s", task_id, exc)
+            self._task_store.save_record(task_id, TaskRecord(
+                task_id=task_id,
+                task_input=task_input,
+                status=TaskStatus.FAILED,
+                error_message=str(exc),
+                page_number=page_number,
+            ))
             return {
                 "success": False,
                 "task_id": task_id,
@@ -295,6 +303,12 @@ class VideoLectureService:
 
         except Exception as exc:
             logger.exception("process_local_file failed task_id=%s error=%s", task_id, exc)
+            self._task_store.save_record(task_id, TaskRecord(
+                task_id=task_id,
+                task_input=TaskInput(url=f"file://{local_path}", title=effective_title, language=language),
+                status=TaskStatus.FAILED,
+                error_message=str(exc),
+            ))
             return {"success": False, "task_id": task_id, "error": format_error_for_user(exc)}
 
     def resummary(
@@ -342,6 +356,7 @@ class VideoLectureService:
                 "lecture": lecture,
                 "mindmap": mindmap,
             })
+            video_id = existing.video_info.canonical_id or existing.video_info.id
             self._task_store.save(new_task_id, new_result)
             self._task_store.save_record(new_task_id, TaskRecord(
                 task_id=new_task_id,
@@ -351,7 +366,6 @@ class VideoLectureService:
                 video_id=video_id,
             ))
 
-            video_id = existing.video_info.canonical_id or existing.video_info.id
             if self.settings.knowledge_enabled:
                 self.knowledge_store.register_result(video_id, new_result)
                 self.knowledge_store.index_video(video_id)
@@ -719,24 +733,28 @@ class VideoLectureService:
         self._task_store.save_record(task_id, record)
 
         cancel_event = threading.Event()
-        self._cancel_events[task_id] = cancel_event
+        with self._state_lock:
+            self._cancel_events[task_id] = cancel_event
 
         def _worker() -> None:
             self._task_store.update_record_status(task_id, TaskStatus.RUNNING)
-            self._running_tasks[task_id] = {"stage": "starting", "progress": 0}
+            with self._state_lock:
+                self._running_tasks[task_id] = {"stage": "starting", "progress": 0}
 
             def on_event(event: PipelineEvent) -> None:
-                self._running_tasks[task_id] = {
-                    "stage": event.stage,
-                    "progress": event.progress,
-                    "message": event.message,
-                }
+                with self._state_lock:
+                    self._running_tasks[task_id] = {
+                        "stage": event.stage,
+                        "progress": event.progress,
+                        "message": event.message,
+                    }
 
             try:
                 result = run_sync(
                     task_input=task_input,
                     settings=self.settings,
                     emit=on_event,
+                    cancel_event=cancel_event,
                 )
                 video_id = result.video_info.canonical_id or result.video_info.id
                 self._task_store.save(task_id, result)
@@ -749,14 +767,20 @@ class VideoLectureService:
                         self.knowledge_store.index_video(video_id)
                     except Exception as exc:
                         logger.warning("knowledge indexing failed for %s: %s", task_id, exc)
+            except TaskCancelledError:
+                logger.info("async task %s cancelled by user", task_id)
+                self._task_store.update_record_status(
+                    task_id, TaskStatus.CANCELLED, error_message="任务已被用户取消"
+                )
             except Exception as exc:
                 logger.exception("async task %s failed: %s", task_id, exc)
                 self._task_store.update_record_status(
                     task_id, TaskStatus.FAILED, error_message=str(exc)
                 )
             finally:
-                self._running_tasks.pop(task_id, None)
-                self._cancel_events.pop(task_id, None)
+                with self._state_lock:
+                    self._running_tasks.pop(task_id, None)
+                    self._cancel_events.pop(task_id, None)
 
         thread = threading.Thread(target=_worker, daemon=True, name=f"task-{task_id[:8]}")
         thread.start()
@@ -782,7 +806,8 @@ class VideoLectureService:
         }
 
         if record.status == TaskStatus.RUNNING:
-            progress_info = self._running_tasks.get(task_id, {})
+            with self._state_lock:
+                progress_info = self._running_tasks.get(task_id, {})
             response["stage"] = progress_info.get("stage", "unknown")
             response["progress"] = progress_info.get("progress", 0)
             response["message"] = progress_info.get("message", "")
@@ -802,11 +827,12 @@ class VideoLectureService:
             return {"success": False, "error": f"未找到任务 {task_id}"}
         if record.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
             return {"success": False, "error": f"任务状态为 {record.status.value}，无法取消"}
-        cancel_event = self._cancel_events.get(task_id)
-        if cancel_event is not None:
-            cancel_event.set()
+        with self._state_lock:
+            cancel_event = self._cancel_events.get(task_id)
+            if cancel_event is not None:
+                cancel_event.set()
+            self._running_tasks.pop(task_id, None)
         self._task_store.update_record_status(task_id, TaskStatus.CANCELLED)
-        self._running_tasks.pop(task_id, None)
         return {"success": True, "task_id": task_id, "status": "cancelled"}
 
     def get_capabilities(self) -> dict:
@@ -851,6 +877,7 @@ def run_sync(
     task_input: TaskInput,
     settings: SkillSettings,
     emit: Callable | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> PipelineResult:
     result = PipelineResult()
 
@@ -860,12 +887,18 @@ def run_sync(
             emit(event)
         logger.info("pipeline stage=%s progress=%s message=%s", stage, progress, message)
 
+    def _check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskCancelledError("任务已被用户取消")
+
+    _check_cancel()
     _emit("preparing", 5, "正在规范化视频链接")
     normalized_url, _ = normalize_video_url(task_input.url)
 
     task_dir = settings.tasks_dir / "latest"
     task_dir.mkdir(parents=True, exist_ok=True)
 
+    _check_cancel()
     _emit("downloading", 8, "正在探测视频信息")
     audio_path, video_info = download_audio(
         url=normalized_url,
@@ -877,6 +910,7 @@ def run_sync(
 
     video_file_path = ""
     try:
+        _check_cancel()
         video_path, _ = download_video(
             url=normalized_url,
             output_dir=task_dir,
@@ -890,6 +924,7 @@ def run_sync(
 
     result.video_file_path = video_file_path
 
+    _check_cancel()
     _emit("transcribing", 50, f"开始语音转写（{settings.transcribe_mode.value}模式）")
 
     transcription = transcribe_audio(
@@ -908,6 +943,7 @@ def run_sync(
 
     title = task_input.title or video_info.title or "视频"
 
+    _check_cancel()
     _emit("lecture", 86, "开始生成讲义")
     lecture = generate_lecture(
         transcription=transcription,
@@ -926,6 +962,7 @@ def run_sync(
     result.key_points = [c for s in lecture.sections for c in s.key_concepts]
     result.knowledge_note_markdown = lecture.overview
 
+    _check_cancel()
     _emit("mindmap", 94, "开始生成思维导图")
     mindmap = generate_mindmap(
         transcription=transcription,

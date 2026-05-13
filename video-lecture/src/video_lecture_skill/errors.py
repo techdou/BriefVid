@@ -17,6 +17,10 @@ class LLMError(VideoLectureError):
     pass
 
 
+class TaskCancelledError(VideoLectureError):
+    pass
+
+
 class LLMConfigurationError(LLMError):
     pass
 

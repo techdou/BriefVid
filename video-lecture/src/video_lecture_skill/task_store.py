@@ -5,7 +5,6 @@ import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
 
 from video_lecture_skill.models import (
     PipelineResult,

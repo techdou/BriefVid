@@ -826,7 +826,14 @@ async def process_video_async(
         page_number: B站多P视频分P号，可选
     """
     effective_mode = _resolve_transcribe_mode(transcribe_mode)
-    service = _make_service_with_mode(effective_mode) if effective_mode else _get_service()
+    service = _get_service()
+    if effective_mode and effective_mode != service.settings.transcribe_mode:
+        service = VideoLectureService(
+            service.settings.model_copy(update={"transcribe_mode": effective_mode})
+        )
+        service._task_store = _get_service()._task_store
+        service._running_tasks = _get_service()._running_tasks
+        service._cancel_events = _get_service()._cancel_events
     result = service.process_async(
         url=url, title=title, language=language, page_number=page_number,
     )
@@ -1083,7 +1090,10 @@ async def switch_config_profile(name: str) -> str:
     global _service, _settings
     service = _get_service()
     profiles_dir = service.settings.data_dir / "profiles"
-    profile_path = profiles_dir / f"{name}.json"
+    safe_name = "".join(c for c in name if c.isalnum() or c in ("_", "-")).strip()
+    if not safe_name:
+        return json.dumps({"success": False, "error": "方案名称无效"}, ensure_ascii=False)
+    profile_path = profiles_dir / f"{safe_name}.json"
 
     if not profile_path.exists():
         return json.dumps({
