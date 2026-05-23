@@ -461,6 +461,13 @@ async function handleSettingsSubmit(event) {
     siliconflow_asr_base_url: readTrimmedValue("siliconflow_asr_base_url", current.siliconflow_asr_base_url || ""),
     siliconflow_asr_model: readTrimmedValue("siliconflow_asr_model", current.siliconflow_asr_model || "TeleAI/TeleSpeechASR"),
     siliconflow_asr_api_key: readValue("siliconflow_asr_api_key", current.siliconflow_asr_api_key || ""),
+    siliconflow_asr_chunk_duration_seconds: readNumberValue("siliconflow_asr_chunk_duration_seconds", current.siliconflow_asr_chunk_duration_seconds ?? 1800),
+    siliconflow_asr_concurrency: readNumberValue("siliconflow_asr_concurrency", current.siliconflow_asr_concurrency ?? 2),
+    multimodal_asr_base_url: readTrimmedValue("multimodal_asr_base_url", current.multimodal_asr_base_url || ""),
+    multimodal_asr_model: readTrimmedValue("multimodal_asr_model", current.multimodal_asr_model || "mimo-v2-omni"),
+    multimodal_asr_api_key: readValue("multimodal_asr_api_key", current.multimodal_asr_api_key || ""),
+    multimodal_asr_chunk_duration_seconds: readNumberValue("multimodal_asr_chunk_duration_seconds", current.multimodal_asr_chunk_duration_seconds ?? 180),
+    multimodal_asr_max_retries: readNumberValue("multimodal_asr_max_retries", current.multimodal_asr_max_retries ?? 5),
     cuda_variant: readValue("cuda_variant", current.cuda_variant || "cu128"),
     runtime_channel: readValue("runtime_channel", current.runtime_channel || "base"),
     output_dir: readTrimmedValue("output_dir", current.output_dir || ""),
@@ -473,6 +480,14 @@ async function handleSettingsSubmit(event) {
     llm_base_url: readTrimmedValue("llm_base_url", current.llm_base_url || ""),
     llm_model: readTrimmedValue("llm_model", current.llm_model || ""),
     llm_api_key: readValue("llm_api_key", current.llm_api_key || ""),
+    knowledge_llm_mode: readValue("knowledge_llm_mode", current.knowledge_llm_mode || "same_as_main"),
+    knowledge_llm_enabled: readChecked("knowledge_llm_enabled", Boolean(current.knowledge_llm_enabled)),
+    knowledge_llm_provider: readTrimmedValue("knowledge_llm_provider", current.knowledge_llm_provider || "openai-compatible"),
+    knowledge_llm_base_url: readTrimmedValue("knowledge_llm_base_url", current.knowledge_llm_base_url || ""),
+    knowledge_llm_model: readTrimmedValue("knowledge_llm_model", current.knowledge_llm_model || ""),
+    knowledge_llm_api_key: readValue("knowledge_llm_api_key", current.knowledge_llm_api_key || ""),
+    knowledge_enabled: readChecked("knowledge_enabled", Boolean(current.knowledge_enabled)),
+    knowledge_index_auto_rebuild: readValue("knowledge_index_auto_rebuild", current.knowledge_index_auto_rebuild || "disabled"),
     summary_system_prompt: readValue("summary_system_prompt", current.summary_system_prompt || ""),
     summary_user_prompt_template: readValue(
       "summary_user_prompt_template",
@@ -542,7 +557,7 @@ async function handleInstallCuda() {
     setTransientStatus(
       "cudaActionStatus",
       response.restartRequired
-        ? "CUDA 安装完成，请重启应用后切换到新的 GPU 运行时"
+        ? "CUDA 安装完成，请重启应用后切换到新的 GPU 运行环境"
         : "CUDA 安装完成",
       { shouldRender: false },
     );

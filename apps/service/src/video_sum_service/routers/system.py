@@ -2,10 +2,18 @@ import os
 import re
 import threading
 
-import httpx
 from fastapi import APIRouter, HTTPException, Request
-
+from fastapi.responses import JSONResponse
 from video_sum_core.models.tasks import TaskStatus
+from video_sum_infra.prompt_library import (
+    BUILTIN_PRESETS,
+    DEFAULT_PRESET_ID,
+    PromptPreset,
+    delete_custom_preset,
+    load_presets,
+    match_preset,
+    save_custom_preset,
+)
 from video_sum_infra.runtime import (
     activate_runtime_pythonpath,
     bootstrap_managed_runtime,
@@ -14,13 +22,25 @@ from video_sum_infra.runtime import (
     service_log_path,
 )
 
-from video_sum_service.context import app_info, logger, settings_manager
+from video_sum_service.auth import (
+    describe_token_source,
+    extract_bearer_token,
+    request_is_authorized,
+    set_session_cookie,
+)
+from video_sum_service.bilibili_cookies import (
+    capture_bilibili_cookies_from_browser,
+    create_bilibili_login_qrcode,
+    poll_bilibili_login_qrcode,
+)
+from video_sum_service.context import access_token_manager, app_info, logger, settings_manager
 from video_sum_service.integrations import (
     extract_http_error_detail,
     probe_asr_connection,
     probe_llm_connection,
     read_log_tail,
 )
+from video_sum_service.runtime_startup import get_runtime_startup_state, mark_runtime_worker_ready
 from video_sum_service.runtime_support import (
     build_worker,
     clear_environment_probe_cache,
@@ -34,10 +54,17 @@ from video_sum_service.runtime_support import (
     sync_all_runtime_channels,
     sync_runtime_channel,
 )
+from video_sum_service.schemas import (
+    PromptMatchRequest,
+    PromptMatchResponse,
+    PromptPresetCreateRequest,
+    PromptPresetResponse,
+)
 from video_sum_service.settings_manager import SettingsUpdatePayload
 
 router = APIRouter(prefix="/api/v1")
 LATEST_RELEASE_URL = "https://api.github.com/repos/lycohana/BiliSum/releases/latest"
+BUILTIN_PROMPT_PRESET_IDS = {preset.id for preset in BUILTIN_PRESETS}
 
 
 def _clear_knowledge_service_cache(app_state) -> None:
@@ -49,6 +76,50 @@ def _clear_knowledge_service_cache(app_state) -> None:
     ):
         if hasattr(app_state, key):
             delattr(app_state, key)
+
+
+def _prompt_preset_response(preset: PromptPreset) -> PromptPresetResponse:
+    return PromptPresetResponse(
+        id=preset.id,
+        name=preset.name,
+        description=preset.description,
+        category=preset.category,
+        system_prompt=preset.system_prompt,
+        user_prompt_template=preset.user_prompt_template,
+        auto_match_keywords=preset.auto_match_keywords,
+        is_builtin=preset.id in BUILTIN_PROMPT_PRESET_IDS,
+    )
+
+
+def _load_prompt_presets() -> list[PromptPreset]:
+    current_settings = settings_manager.current
+    return load_presets(
+        data_dir=current_settings.data_dir,
+        prompt_presets_path=current_settings.prompt_presets_path,
+    )
+
+
+def _normalize_custom_prompt_preset_id(name: str) -> str:
+    normalized_id = re.sub(
+        r"[^\w]+",
+        "_",
+        str(name or "").strip().lower(),
+        flags=re.UNICODE,
+    ).strip("_")
+    if not normalized_id:
+        raise HTTPException(status_code=400, detail="预设名称不能为空。")
+    return normalized_id
+
+
+def _prompt_match_metadata(title: str, preset: PromptPreset) -> tuple[str, float]:
+    normalized_title = str(title or "").strip().lower()
+    if not normalized_title or preset.id == DEFAULT_PRESET_ID:
+        return "fallback", 0.4
+    for keyword in preset.auto_match_keywords:
+        normalized_keyword = str(keyword or "").strip().lower()
+        if normalized_keyword and normalized_keyword in normalized_title:
+            return "keyword", 0.9
+    return "fallback", 0.4
 
 
 def _normalize_version(value: str | None) -> str:
@@ -68,16 +139,83 @@ def _version_key(value: str | None) -> tuple[int | str, ...]:
     return tuple(parts) or (0,)
 
 
+@router.get("/prompts/presets", response_model=list[PromptPresetResponse])
+def list_prompt_presets() -> list[PromptPresetResponse]:
+    return [_prompt_preset_response(preset) for preset in _load_prompt_presets()]
+
+
+@router.post("/prompts/presets", response_model=PromptPresetResponse)
+def save_prompt_preset(payload: PromptPresetCreateRequest) -> PromptPresetResponse:
+    preset_id = _normalize_custom_prompt_preset_id(payload.name)
+    if preset_id in BUILTIN_PROMPT_PRESET_IDS:
+        raise HTTPException(status_code=400, detail="内置预设不能被覆盖。")
+
+    preset = PromptPreset(
+        id=preset_id,
+        name=payload.name.strip(),
+        description=str(payload.description or "").strip(),
+        category=str(payload.category or "custom").strip() or "custom",
+        system_prompt=payload.system_prompt.strip(),
+        user_prompt_template=payload.user_prompt_template.strip(),
+        auto_match_keywords=payload.auto_match_keywords,
+    )
+    if not preset.system_prompt or not preset.user_prompt_template:
+        raise HTTPException(status_code=400, detail="System prompt 和 User prompt 不能为空。")
+
+    current_settings = settings_manager.current
+    save_custom_preset(
+        preset,
+        data_dir=current_settings.data_dir,
+        prompt_presets_path=current_settings.prompt_presets_path,
+    )
+    return _prompt_preset_response(preset)
+
+
+@router.delete("/prompts/presets/{preset_id}")
+def delete_prompt_preset(preset_id: str) -> dict[str, object]:
+    normalized_id = str(preset_id or "").strip()
+    if normalized_id in BUILTIN_PROMPT_PRESET_IDS:
+        raise HTTPException(status_code=400, detail="内置预设不能删除。")
+
+    current_settings = settings_manager.current
+    delete_custom_preset(
+        normalized_id,
+        data_dir=current_settings.data_dir,
+        prompt_presets_path=current_settings.prompt_presets_path,
+    )
+    return {"deleted": True, "preset_id": normalized_id}
+
+
+@router.post("/prompts/match", response_model=PromptMatchResponse)
+def match_prompt_preset(payload: PromptMatchRequest) -> PromptMatchResponse:
+    presets = _load_prompt_presets()
+    preset = match_preset(payload.title, presets=presets)
+    match_type, confidence = _prompt_match_metadata(payload.title, preset)
+    return PromptMatchResponse(
+        preset=_prompt_preset_response(preset),
+        match_type=match_type,
+        confidence=confidence,
+    )
+
+
 @router.get("/system/info")
-def system_info(runtime_channel: str | None = None, refresh: bool = False) -> dict[str, object]:
+def system_info(request: Request, runtime_channel: str | None = None, refresh: bool = False) -> dict[str, object]:
     current_settings = settings_manager.current
     active_channel = runtime_channel or current_settings.runtime_channel
+    runtime_startup = get_runtime_startup_state(request.app.state)
+    should_probe_environment = refresh or runtime_channel is not None
     if refresh:
         clear_environment_probe_cache(active_channel)
-    environment = detect_environment(active_channel)
+    environment = (
+        detect_environment(active_channel)
+        if should_probe_environment
+        else dict(runtime_startup.get("environment") or {})
+    )
     runtime_settings = current_settings.with_resolved_runtime(
         cuda_available=bool(environment.get("cudaAvailable"))
     )
+    worker = getattr(request.app.state, "task_worker", None)
+    worker_snapshot = worker.snapshot() if hasattr(worker, "snapshot") else None
     return {
         "application": {"name": app_info.name, "version": app_info.version},
         "service": {
@@ -98,18 +236,51 @@ def system_info(runtime_channel: str | None = None, refresh: bool = False) -> di
             "llm_enabled": current_settings.llm_enabled,
             "llm_model": current_settings.llm_model,
         },
+        "runtimeStartup": runtime_startup,
+        "process": {
+            "thread_count": threading.active_count(),
+            "threads": [thread.name for thread in threading.enumerate()[:80]],
+        },
+        "worker": worker_snapshot,
         "taskModel": {"statuses": [status.value for status in TaskStatus]},
         "environment": environment,
     }
 
 
 @router.get("/settings")
-def get_settings() -> dict[str, object]:
-    return serialize_settings(settings_manager.current)
+def get_settings(request: Request) -> dict[str, object]:
+    runtime_startup = get_runtime_startup_state(request.app.state)
+    environment = dict(runtime_startup.get("environment") or {})
+    return serialize_settings(settings_manager.current, environment_info=environment)
+
+
+@router.get("/auth/status")
+def get_auth_status(request: Request) -> dict[str, object]:
+    return {
+        **describe_token_source(access_token_manager),
+        "authenticated": request_is_authorized(request, access_token_manager),
+    }
+
+
+@router.post("/auth/session")
+def create_auth_session(request: Request) -> JSONResponse:
+    token = extract_bearer_token(request)
+    if not access_token_manager.verify(token):
+        raise HTTPException(status_code=401, detail="访问密钥无效。")
+    response = JSONResponse(
+        {
+            "authenticated": True,
+            **describe_token_source(access_token_manager),
+        }
+    )
+    set_session_cookie(response, token or "")
+    return response
 
 
 @router.get("/app/update")
 def get_app_update() -> dict[str, object]:
+    import httpx
+
     current_version = app_info.version
     headers = {
         "Accept": "application/vnd.github+json",
@@ -173,6 +344,11 @@ def update_settings(payload: SettingsUpdatePayload, request: Request) -> dict[st
             environment_info=environment,
         ),
     )
+    mark_runtime_worker_ready(
+        request.app.state,
+        environment,
+        "Runtime worker refreshed after settings update.",
+    )
     return {
         "saved": True,
         "settings": serialize_settings(current_settings, environment_info=environment),
@@ -188,6 +364,30 @@ def post_llm_test(payload: SettingsUpdatePayload | None = None) -> dict[str, obj
 @router.post("/asr/test")
 def post_asr_test(payload: SettingsUpdatePayload | None = None) -> dict[str, object]:
     return probe_asr_connection(payload)
+
+
+@router.post("/bilibili/cookies/capture")
+def post_bilibili_cookies_capture() -> dict[str, object]:
+    try:
+        return capture_bilibili_cookies_from_browser()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/bilibili/cookies/qrcode")
+def post_bilibili_cookies_qrcode() -> dict[str, object]:
+    try:
+        return create_bilibili_login_qrcode()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/bilibili/cookies/qrcode/{qrcode_key}")
+def get_bilibili_cookies_qrcode(qrcode_key: str) -> dict[str, object]:
+    try:
+        return poll_bilibili_login_qrcode(qrcode_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/environment")
@@ -220,6 +420,11 @@ def post_runtime_sync(request: Request, payload: dict[str, object] | None = None
                 environment_info=environment,
             ),
         )
+        mark_runtime_worker_ready(
+            request.app.state,
+            environment,
+            "Runtime worker refreshed after runtime sync.",
+        )
         return {
             **result,
             "environment": environment,
@@ -229,7 +434,7 @@ def post_runtime_sync(request: Request, payload: dict[str, object] | None = None
         raise
     except Exception as exc:
         logger.exception("runtime sync failed requested_channel=%s error=%s", requested_channel or "all", exc)
-        raise HTTPException(status_code=500, detail=f"运行时同步失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=f"运行环境同步失败：{exc}") from exc
 
 
 @router.get("/system/logs")
@@ -260,6 +465,12 @@ def post_cuda_install(payload: dict[str, object], request: Request) -> dict[str,
     result, worker = install_cuda_support(str(requested_variant), request.app.state.task_repository)
     _clear_knowledge_service_cache(request.app.state)
     replace_task_worker(request.app.state, worker)
+    if isinstance(result.get("environment"), dict):
+        mark_runtime_worker_ready(
+            request.app.state,
+            result["environment"],
+            "Runtime worker refreshed after CUDA install.",
+        )
     return result
 
 
@@ -268,6 +479,12 @@ def post_local_asr_install(request: Request, payload: dict[str, object] | None =
     reinstall = bool((payload or {}).get("reinstall"))
     result, worker = install_local_asr(reinstall=reinstall, repository=request.app.state.task_repository)
     replace_task_worker(request.app.state, worker)
+    if isinstance(result.get("environment"), dict):
+        mark_runtime_worker_ready(
+            request.app.state,
+            result["environment"],
+            "Runtime worker refreshed after ASR install.",
+        )
     return result
 
 
@@ -277,4 +494,10 @@ def post_knowledge_install(request: Request, payload: dict[str, object] | None =
     result, worker = install_knowledge_dependencies(reinstall=reinstall, repository=request.app.state.task_repository)
     _clear_knowledge_service_cache(request.app.state)
     replace_task_worker(request.app.state, worker)
+    if isinstance(result.get("environment"), dict):
+        mark_runtime_worker_ready(
+            request.app.state,
+            result["environment"],
+            "Runtime worker refreshed after knowledge install.",
+        )
     return result

@@ -10,10 +10,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import unquote, urlencode, urlparse
 
-import httpx
 from fastapi import HTTPException
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
 
 from video_sum_core.models.tasks import InputType
 from video_sum_core.utils import extract_bilibili_page, normalize_video_url
@@ -25,6 +22,8 @@ from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.schemas import VideoAssetRecord, VideoPageOptionResponse
 
 logger = logging.getLogger("video_sum_service.app")
+YoutubeDL = None
+DownloadError = None
 
 _BILIBILI_HTTP_HEADERS = {
     "User-Agent": (
@@ -134,6 +133,16 @@ def build_ydl_probe_options(*, extract_flat: bool = False) -> dict[str, object]:
 
 
 def extract_video_info(url: str, *, extract_flat: bool = False) -> dict[str, object]:
+    global DownloadError, YoutubeDL
+    if YoutubeDL is None:
+        from yt_dlp import YoutubeDL as YtDlpYoutubeDL
+
+        YoutubeDL = YtDlpYoutubeDL
+    if DownloadError is None:
+        from yt_dlp.utils import DownloadError as YtDlpDownloadError
+
+        DownloadError = YtDlpDownloadError
+
     options = build_ydl_probe_options(extract_flat=extract_flat)
     try:
         with YoutubeDL(options) as ydl:
@@ -170,7 +179,34 @@ def extract_video_info(url: str, *, extract_flat: bool = False) -> dict[str, obj
     return info
 
 
-def fetch_bilibili_page_catalog(url: str) -> list[dict[str, object]]:
+def extract_thumbnail_url(payload: dict[str, object] | None) -> str:
+    if not payload:
+        return ""
+
+    for key in ("thumbnail", "cover", "pic", "first_frame"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    thumbnails = payload.get("thumbnails")
+    if isinstance(thumbnails, list):
+        for item in reversed(thumbnails):
+            if isinstance(item, dict):
+                value = item.get("url")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            elif isinstance(item, str) and item.strip():
+                return item.strip()
+    return ""
+
+
+def first_non_empty(*values: str | None) -> str:
+    return next((value.strip() for value in values if isinstance(value, str) and value.strip()), "")
+
+
+def fetch_bilibili_page_catalog_payload(url: str) -> tuple[list[dict[str, object]], str]:
+    import httpx
+
     try:
         response = httpx.get(
             url,
@@ -184,21 +220,27 @@ def fetch_bilibili_page_catalog(url: str) -> list[dict[str, object]]:
         response.raise_for_status()
     except httpx.HTTPError:
         logger.warning("failed to fetch bilibili page catalog: %s", url, exc_info=True)
-        return []
+        return [], ""
 
     match = re.search(r"__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;\s*\(function", response.text, re.S)
     if not match:
-        return []
+        return [], ""
 
     try:
         payload = json.loads(match.group(1))
     except json.JSONDecodeError:
         logger.warning("failed to parse bilibili page catalog payload: %s", url, exc_info=True)
-        return []
+        return [], ""
 
     video_data = payload.get("videoData") or {}
     pages = video_data.get("pages") or []
-    return [item for item in pages if isinstance(item, dict)]
+    cover_url = str(video_data.get("pic") or "").strip()
+    return [item for item in pages if isinstance(item, dict)], cover_url
+
+
+def fetch_bilibili_page_catalog(url: str) -> list[dict[str, object]]:
+    pages, _cover_url = fetch_bilibili_page_catalog_payload(url)
+    return pages
 
 
 def build_base_video_asset(
@@ -502,21 +544,26 @@ def probe_video_asset(
         if len(flat_entries) > 1:
             top_title = str(flat_info.get("title") or canonical_id or normalized_url)
             top_id = str(flat_info.get("id") or canonical_id or normalized_url)
-            catalog_entries = fetch_bilibili_page_catalog(normalized_url)
+            catalog_entries, catalog_cover_url = fetch_bilibili_page_catalog_payload(normalized_url)
+            catalog_by_page = {
+                int(item.get("page") or 0): item
+                for item in catalog_entries
+                if str(item.get("page") or "").isdigit()
+            }
+            top_thumbnail = first_non_empty(
+                extract_thumbnail_url(flat_info),
+                catalog_cover_url,
+                *(extract_thumbnail_url(entry) for entry in flat_entries),
+                *(extract_thumbnail_url(entry) for entry in catalog_entries),
+            )
+            cached_cover_url = cache_cover_image(top_thumbnail, top_id, referer_url=normalized_url)
             pages: list[VideoPageOptionResponse] = []
             for index, entry in enumerate(flat_entries, start=1):
                 page_url = str(
                     entry.get("url")
                     or with_bilibili_page(f"https://www.bilibili.com/video/{canonical_id}", index)
                 )
-                catalog_entry = next(
-                    (
-                        item
-                        for item in catalog_entries
-                        if int(item.get("page") or 0) == index
-                    ),
-                    None,
-                )
+                catalog_entry = catalog_by_page.get(index)
                 page_title = build_page_title(
                     top_title,
                     index,
@@ -530,7 +577,12 @@ def probe_video_asset(
                         page=index,
                         title=page_title,
                         source_url=page_url,
-                        cover_url="",
+                        cover_url=first_non_empty(
+                            extract_thumbnail_url(entry),
+                            extract_thumbnail_url(catalog_entry),
+                            cached_cover_url,
+                            top_thumbnail,
+                        ),
                         duration=None,
                     )
                 )
@@ -541,7 +593,7 @@ def probe_video_asset(
                     platform=str(flat_info.get("extractor_key") or "video").lower(),
                     title=top_title,
                     source_url=f"https://www.bilibili.com/video/{canonical_id}",
-                    cover_url="",
+                    cover_url=cached_cover_url,
                     duration=None,
                     pages=pages,
                 ),
@@ -614,6 +666,17 @@ def probe_video_asset(
 
 
 def localize_video_cover(task_store: SqliteTaskRepository, video: VideoAssetRecord) -> VideoAssetRecord:
+    if not video.cover_url and str(video.platform or "").lower() == "bilibili":
+        probe_url = video.source_url or f"https://www.bilibili.com/video/{str(video.canonical_id).split('?', 1)[0]}"
+        try:
+            refreshed, _pages, _requires_selection = probe_video_asset(probe_url, force_refresh=True)
+        except Exception:
+            logger.warning("failed to refresh missing bilibili cover: %s", video.video_id, exc_info=True)
+            return video
+        merged = merge_video_asset_metadata(video, refreshed)
+        if merged.cover_url:
+            return task_store.upsert_video_asset(merged)
+        return video
     if not video.cover_url or video.cover_url.startswith("/media/"):
         return video
     localized = cache_cover_image(video.cover_url, video.canonical_id, referer_url=video.source_url)

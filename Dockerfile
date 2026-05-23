@@ -1,38 +1,12 @@
-FROM python:3.12-slim AS ffmpeg-static
-
-ARG FFMPEG_STATIC_URL=https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-ENV FFMPEG_STATIC_URL=${FFMPEG_STATIC_URL}
-
-RUN python - <<'PY'
-import os
-import lzma
-import shutil
-import tarfile
-import urllib.request
-from pathlib import Path
-
-url = os.environ["FFMPEG_STATIC_URL"]
-archive = Path("/tmp/ffmpeg-static.tar.xz")
-extract_root = Path("/tmp/ffmpeg")
-target_dir = Path("/opt/ffmpeg/bin")
-
-urllib.request.urlretrieve(url, archive)
-extract_root.mkdir(parents=True, exist_ok=True)
-
-with lzma.open(archive, "rb") as compressed, tarfile.open(fileobj=compressed, mode="r:") as tar:
-    tar.extractall(extract_root)
-
-members = list(extract_root.rglob("ffmpeg")) + list(extract_root.rglob("ffprobe"))
-target_dir.mkdir(parents=True, exist_ok=True)
-
-for binary_name in ("ffmpeg", "ffprobe"):
-    source = next(path for path in members if path.name == binary_name and path.is_file())
-    destination = target_dir / binary_name
-    shutil.copy2(source, destination)
-    destination.chmod(0o755)
-PY
-
 FROM python:3.12-slim
+
+ARG APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV PATH=/opt/ffmpeg/bin:${PATH} \
     PYTHONUNBUFFERED=1 \
@@ -50,15 +24,13 @@ ENV PATH=/opt/ffmpeg/bin:${PATH} \
 
 WORKDIR /app
 
-COPY --from=ffmpeg-static /opt/ffmpeg /opt/ffmpeg
-
 COPY pyproject.toml VERSION ./
 COPY packages ./packages
 COPY apps/service ./apps/service
 COPY apps/web/static ./apps/web/static
 
 RUN python -m pip install --upgrade pip setuptools wheel hatchling \
-    && python -m pip install -e ./packages/infra -e ./packages/core -e ./apps/service
+    && python -m pip install ./packages/infra ./packages/core './apps/service[knowledge]'
 
 RUN mkdir -p /data/cache /data/tasks /data/logs
 

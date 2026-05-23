@@ -1,4 +1,5 @@
 import type {
+  AuthStatus,
   EnvironmentInfo,
   RuntimeStatus,
   KnowledgeAskResponse,
@@ -11,6 +12,9 @@ import type {
   KnowledgeTagListResponse,
   KnowledgeToolTrace,
   LlmTestResponse,
+  PromptMatchResult,
+  PromptPreset,
+  PromptPresetCreateRequest,
   ServiceSettings,
   SystemLogResponse,
   SystemInfo,
@@ -18,6 +22,7 @@ import type {
   TaskEvent,
   TaskMarkdownExportResponse,
   TaskMindMapResponse,
+  TaskVisualEvidenceResponse,
   TaskSummary,
   VideoKnowledgeTagListResponse,
   VideoAssetDetail,
@@ -42,8 +47,50 @@ export type AppUpdateInfo = {
   errorMessage: string | null;
 };
 
+export type LlmTestPayload = Partial<ServiceSettings> & {
+  llm_test_scope?: "main" | "knowledge" | "visual";
+};
+
+export type BilibiliCookieCaptureResponse = {
+  cookiesFile: string;
+  cookieCount: number;
+  browser?: string;
+};
+
+export type BilibiliQrcodeLoginResponse = {
+  url: string;
+  qrcodeKey: string;
+  expiresIn: number;
+};
+
+export type BilibiliQrcodePollResponse = {
+  status: "pending" | "scanned" | "expired" | "confirmed";
+  message: string;
+  cookiesFile?: string;
+  cookieCount?: number;
+};
+
+export class AuthRequiredError extends Error {
+  constructor(message = "需要输入 BiliSum 访问密钥。") {
+    super(message);
+    this.name = "AuthRequiredError";
+  }
+}
+
+async function withDesktopAuth(options?: RequestInit): Promise<RequestInit | undefined> {
+  const token = await window.desktop?.backend?.getAccessToken?.();
+  if (!token) {
+    return options;
+  }
+  const headers = new Headers(options?.headers);
+  if (!headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  return { ...options, headers };
+}
+
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, options);
+  const response = await fetch(url, await withDesktopAuth(options));
   if (!response.ok) {
     const text = await response.text();
     let detail = text || `Request failed: ${response.status}`;
@@ -53,9 +100,16 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
     } catch {
       detail = text || `Request failed: ${response.status}`;
     }
+    if (response.status === 401) {
+      throw new AuthRequiredError(detail);
+    }
     throw new Error(detail);
   }
   return response.json() as Promise<T>;
+}
+
+async function fetchJsonWithAuth<T>(url: string, options?: RequestInit): Promise<T> {
+  return fetchJson<T>(url, options);
 }
 
 function parseSseBlock(block: string): { event: string; data: string } | null {
@@ -82,6 +136,15 @@ function parseSseBlock(block: string): { event: string; data: string } | null {
 }
 
 export const api = {
+  getAuthStatus() {
+    return fetchJson<AuthStatus>("/api/v1/auth/status");
+  },
+  createAuthSession(token: string) {
+    return fetchJson<AuthStatus>("/api/v1/auth/session", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  },
   getHealth() {
     return fetchJson<{ status: string }>("/health");
   },
@@ -93,7 +156,7 @@ export const api = {
     if (options?.refresh) {
       url.searchParams.set("refresh", "1");
     }
-    return fetchJson<SystemInfo>(url.toString());
+    return fetchJsonWithAuth<SystemInfo>(url.toString());
   },
   getEnvironment(options?: { runtimeChannel?: string; refresh?: boolean }) {
     const url = new URL("/api/v1/environment", window.location.origin);
@@ -103,13 +166,13 @@ export const api = {
     if (options?.refresh) {
       url.searchParams.set("refresh", "1");
     }
-    return fetchJson<EnvironmentInfo>(url.toString());
+    return fetchJsonWithAuth<EnvironmentInfo>(url.toString());
   },
   getRuntimeStatus() {
-    return fetchJson<RuntimeStatus>("/api/v1/runtime/status");
+    return fetchJsonWithAuth<RuntimeStatus>("/api/v1/runtime/status");
   },
   syncRuntime(payload?: { runtime_channel?: string }) {
-    return fetchJson<{
+    return fetchJsonWithAuth<{
       synced: boolean;
       runtimeChannel?: string;
       channels?: Array<{ runtimeChannel: string; synced: boolean }>;
@@ -122,10 +185,33 @@ export const api = {
     });
   },
   getSettings() {
-    return fetchJson<ServiceSettings>("/api/v1/settings");
+    return fetchJsonWithAuth<ServiceSettings>("/api/v1/settings");
   },
   getAppUpdate() {
-    return fetchJson<AppUpdateInfo>("/api/v1/app/update");
+    return fetchJsonWithAuth<AppUpdateInfo>("/api/v1/app/update");
+  },
+  listPromptPresets() {
+    return fetchJsonWithAuth<PromptPreset[]>("/api/v1/prompts/presets");
+  },
+  createPromptPreset(payload: PromptPresetCreateRequest) {
+    return fetchJsonWithAuth<PromptPreset>("/api/v1/prompts/presets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  deletePromptPreset(presetId: string) {
+    return fetchJsonWithAuth<{ deleted: boolean; preset_id: string }>(
+      `/api/v1/prompts/presets/${encodeURIComponent(presetId)}`,
+      { method: "DELETE" },
+    );
+  },
+  matchPrompt(title: string) {
+    return fetchJsonWithAuth<PromptMatchResult>("/api/v1/prompts/match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
   },
   updateSettings(payload: Partial<ServiceSettings>) {
     return fetchJson<UpdateSettingsResponse>("/api/v1/settings", {
@@ -134,7 +220,7 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
-  testLlmConnection(payload: Partial<ServiceSettings>) {
+  testLlmConnection(payload: LlmTestPayload) {
     return fetchJson<LlmTestResponse>("/api/v1/llm/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -147,6 +233,19 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+  },
+  captureBilibiliCookiesFromBrowser() {
+    return fetchJson<BilibiliCookieCaptureResponse>("/api/v1/bilibili/cookies/capture", {
+      method: "POST",
+    });
+  },
+  createBilibiliCookieQrcode() {
+    return fetchJson<BilibiliQrcodeLoginResponse>("/api/v1/bilibili/cookies/qrcode", {
+      method: "POST",
+    });
+  },
+  pollBilibiliCookieQrcode(qrcodeKey: string) {
+    return fetchJson<BilibiliQrcodePollResponse>(`/api/v1/bilibili/cookies/qrcode/${encodeURIComponent(qrcodeKey)}`);
   },
   getSystemLogs(lines = 200) {
     return fetchJson<SystemLogResponse>(`/api/v1/system/logs?lines=${lines}`);
@@ -188,10 +287,27 @@ export const api = {
       body: file,
     });
   },
+  uploadBatchVideos(files: File[] | FileList) {
+    const form = new FormData();
+    Array.from(files).forEach((file) => {
+      form.append("files", file, file.name);
+    });
+    return fetchJson<VideoProbeResult[]>("/api/v1/videos/upload/batch", {
+      method: "POST",
+      body: form,
+    });
+  },
   getVideoTasks(videoId: string) {
     return fetchJson<TaskSummary[]>(`/api/v1/videos/${videoId}/tasks`);
   },
-  createVideoTask(videoId: string, payload?: { page_number?: number | null }) {
+  createVideoTask(
+    videoId: string,
+    payload?: {
+      page_number?: number | null;
+      visual_note_mode?: string | null;
+      prompt_preset_id?: string | null;
+    },
+  ) {
     return fetchJson<TaskDetail>(`/api/v1/videos/${videoId}/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -238,8 +354,21 @@ export const api = {
   getTaskMindMap(taskId: string) {
     return fetchJson<TaskMindMapResponse>(`/api/v1/tasks/${taskId}/mindmap`);
   },
-  exportTaskMarkdown(taskId: string, payload?: { target?: "markdown" | "obsidian" }) {
+  getTaskVisualEvidence(taskId: string) {
+    return fetchJson<TaskVisualEvidenceResponse>(`/api/v1/tasks/${taskId}/visual-evidence`);
+  },
+  exportTaskMarkdown(
+    taskId: string,
+    payload?: { target?: "markdown" | "obsidian"; include_transcript?: boolean; output_dir?: string },
+  ) {
     return fetchJson<TaskMarkdownExportResponse>(`/api/v1/tasks/${taskId}/exports/markdown`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload ?? {}),
+    });
+  },
+  exportTaskTranscript(taskId: string, payload?: { output_dir?: string }) {
+    return fetchJson<TaskMarkdownExportResponse>(`/api/v1/tasks/${taskId}/exports/transcript`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload ?? {}),
@@ -251,6 +380,16 @@ export const api = {
       url.searchParams.set("force", "1");
     }
     return fetchJson<TaskMindMapResponse>(url.toString(), { method: "POST" });
+  },
+  generateTaskVisualEvidence(taskId: string, options?: { force?: boolean; mode?: string }) {
+    const url = new URL(`/api/v1/tasks/${taskId}/visual-evidence`, window.location.origin);
+    if (options?.force) {
+      url.searchParams.set("force", "1");
+    }
+    if (options?.mode) {
+      url.searchParams.set("mode", options.mode);
+    }
+    return fetchJson<TaskVisualEvidenceResponse>(url.toString(), { method: "POST" });
   },
   deleteTask(taskId: string) {
     return fetchJson<{ deleted: boolean }>(`/api/v1/tasks/${taskId}`, { method: "DELETE" });
@@ -367,12 +506,12 @@ export const api = {
     },
     options?: { signal?: AbortSignal },
   ) {
-    const response = await fetch("/api/v1/knowledge/ask/stream", {
+    const response = await fetch("/api/v1/knowledge/ask/stream", await withDesktopAuth({
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
       body: JSON.stringify(payload),
       signal: options?.signal,
-    });
+    }));
     if (!response.ok) {
       const text = await response.text();
       throw new Error(text || `Request failed: ${response.status}`);

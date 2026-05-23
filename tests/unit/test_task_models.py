@@ -146,6 +146,23 @@ def test_settings_manager_migrates_missing_task_concurrency_fields(tmp_path: Pat
     assert persisted.mindmap_concurrency == 1
 
 
+def test_settings_manager_migrates_missing_knowledge_note_prompt_fields(tmp_path: Path) -> None:
+    base_settings = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+    )
+    manager = SettingsManager(base_settings)
+    settings_path = base_settings.data_dir / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text('{"summary_mode":"llm"}', encoding="utf-8")
+
+    loaded = manager.load()
+
+    assert loaded.knowledge_note_system_prompt == base_settings.knowledge_note_system_prompt
+    assert loaded.knowledge_note_user_prompt_template == base_settings.knowledge_note_user_prompt_template
+
+
 def test_service_settings_default_to_managed_user_data_dir() -> None:
     settings = ServiceSettings()
 
@@ -253,6 +270,23 @@ def test_real_pipeline_uses_custom_prompt_template() -> None:
     assert "标题=测试标题" in messages[1]["content"]
     assert "转写=转写内容" in messages[1]["content"]
     assert "分段=分段内容" in messages[1]["content"]
+
+
+def test_real_pipeline_uses_custom_knowledge_note_prompt_template() -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=Path("."),
+            knowledge_note_system_prompt="自定义知识笔记系统词",
+            knowledge_note_user_prompt_template="标题={title}\n摘要={summary_json}\n正文={transcript_excerpt}",
+        )
+    )
+
+    messages = runner._build_knowledge_note_messages("测试标题", "转写内容", "分段内容", '{"overview":"概览"}')
+
+    assert messages[0]["content"] == "自定义知识笔记系统词"
+    assert "标题=测试标题" in messages[1]["content"]
+    assert '摘要={"overview":"概览"}' in messages[1]["content"]
+    assert "正文=转写内容" in messages[1]["content"]
 
 
 def test_real_pipeline_builds_separate_knowledge_note_prompt() -> None:

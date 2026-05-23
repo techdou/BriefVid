@@ -4,12 +4,14 @@ from video_sum_infra.app import AppInfo
 from video_sum_infra.config import ServiceSettings
 from video_sum_infra.runtime import log_dir, web_static_dir
 
+from video_sum_service.auth import AccessTokenManager
 from video_sum_service.settings_manager import SettingsManager
 
 logger = logging.getLogger("video_sum_service.app")
 
-settings_manager = SettingsManager(ServiceSettings())
+settings_manager = SettingsManager(ServiceSettings(_env_file=None))
 settings = settings_manager.load()
+access_token_manager = AccessTokenManager(settings.data_dir)
 app_info = AppInfo.load()
 
 WEB_STATIC_DIR = web_static_dir()

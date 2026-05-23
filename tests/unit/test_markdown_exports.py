@@ -60,6 +60,30 @@ def test_build_task_markdown_export_for_markdown_omits_frontmatter_and_tolerates
     assert "- 暂无章节时间线。" in content
 
 
+def test_build_task_markdown_export_can_include_transcript() -> None:
+    content = build_task_markdown_export(
+        title="转写导出",
+        overview="概览",
+        knowledge_note_markdown="## 知识笔记\n\n内容。",
+        key_points=[],
+        timeline=[],
+        source_url="https://example.com/video",
+        platform="unknown",
+        video_id=None,
+        canonical_id=None,
+        task_id="task-3",
+        created_at=datetime(2026, 4, 22, 1, 0, tzinfo=timezone.utc),
+        exported_at=datetime(2026, 4, 22, 9, 30, tzinfo=timezone.utc),
+        tags=["bilisum"],
+        target="markdown",
+        transcript_text="[00:00] 第一条",
+        include_transcript=True,
+    )
+
+    assert "## 转写全文" in content
+    assert "```text\n[00:00] 第一条\n```" in content
+
+
 def test_build_export_filename_sanitizes_invalid_characters() -> None:
     file_name = build_export_filename('函数/映射: 入门?', datetime(2026, 4, 22, 9, 30, tzinfo=timezone.utc))
 

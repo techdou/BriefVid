@@ -1,10 +1,54 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
+
+const fileDropListeners = new Set<(paths: string[]) => void>();
+
+function getFilePaths(files: File[] | FileList | null | undefined) {
+  return Array.from(files || [])
+    .map((file) => webUtils.getPathForFile(file))
+    .filter(Boolean);
+}
+
+function allowFileDrop(event: DragEvent) {
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "copy";
+  }
+}
+
+function registerFileDropGuards(target: Window | Document | HTMLElement | null) {
+  if (!target) {
+    return;
+  }
+  target.addEventListener("dragenter", allowFileDrop as EventListener, true);
+  target.addEventListener("dragover", allowFileDrop as EventListener, true);
+}
+
+registerFileDropGuards(window);
+registerFileDropGuards(document);
+
+window.addEventListener(
+  "drop",
+  (event) => {
+    event.preventDefault();
+    const paths = getFilePaths(event.dataTransfer?.files);
+    if (!paths.length) {
+      return;
+    }
+    window.dispatchEvent(new CustomEvent<string[]>("bilisum:desktop-file-drop", { detail: paths }));
+    for (const listener of fileDropListeners) {
+      listener(paths);
+    }
+  },
+  true,
+);
 
 // 禁用鼠标中键导航（防止打开新窗口）
 // 在 DOM 加载完成后注册事件监听
 document.addEventListener(
   "DOMContentLoaded",
   () => {
+    registerFileDropGuards(document.body);
+
     window.addEventListener(
       "auxclick",
       (event) => {
@@ -27,11 +71,13 @@ document.addEventListener(
       },
       { capture: true },
     );
+
   },
   { once: true },
 );
 
 type CloseBehavior = "ask" | "tray" | "exit";
+type ThemePreference = "light" | "dark";
 
 export type DesktopBackendStatus = {
   running: boolean;
@@ -122,6 +168,7 @@ const desktop = {
     start: () => ipcRenderer.invoke("desktop:backend:start") as Promise<DesktopBackendStatus>,
     stop: () => ipcRenderer.invoke("desktop:backend:stop") as Promise<DesktopBackendStatus>,
     status: () => ipcRenderer.invoke("desktop:backend:status") as Promise<DesktopBackendStatus>,
+    getAccessToken: () => ipcRenderer.invoke("desktop:backend:get-access-token") as Promise<string>,
     onStatus: (listener: (status: DesktopBackendStatus) => void) => {
       const wrapped = (_event: unknown, payload: DesktopBackendStatus) => listener(payload);
       ipcRenderer.on("desktop:backend:status-changed", wrapped);
@@ -135,6 +182,14 @@ const desktop = {
   },
   media: {
     pickVideoFile: () => ipcRenderer.invoke("desktop:media:pick-video-file") as Promise<string | null>,
+    pickVideoFiles: () => ipcRenderer.invoke("desktop:media:pick-video-files") as Promise<string[]>,
+    getFilePaths,
+    onFileDrop: (listener: (paths: string[]) => void) => {
+      fileDropListeners.add(listener);
+      return () => {
+        fileDropListeners.delete(listener);
+      };
+    },
   },
   bilibili: {
     captureLoginCookies: () =>
@@ -142,6 +197,10 @@ const desktop = {
   },
   shell: {
     openPath: (targetPath: string) => ipcRenderer.invoke("desktop:shell:open-path", targetPath) as Promise<string>,
+  },
+  dialog: {
+    pickDirectory: (defaultPath?: string) =>
+      ipcRenderer.invoke("desktop:dialog:pick-directory", defaultPath) as Promise<string | null>,
   },
   logs: {
     getServiceLogPath: () => ipcRenderer.invoke("desktop:logs:get-service-log-path") as Promise<string>,
@@ -153,6 +212,8 @@ const desktop = {
     setCloseBehavior: (value: CloseBehavior) =>
       ipcRenderer.invoke("desktop:preferences:set-close-behavior", value) as Promise<CloseBehavior>,
     resetCloseBehavior: () => ipcRenderer.invoke("desktop:preferences:reset-close-behavior") as Promise<CloseBehavior>,
+    setTheme: (value: ThemePreference) =>
+      ipcRenderer.invoke("desktop:preferences:set-theme", value) as Promise<ThemePreference>,
   },
   update: {
     check: () => ipcRenderer.invoke("desktop:update:check") as Promise<UpdateInfo>,
@@ -168,12 +229,12 @@ const desktop = {
     },
   },
   fileManager: {
-    getStorageOverview: (input: { dataDir: string; cacheDir: string; tasksDir: string; taskIds?: string[] }) =>
+    getStorageOverview: (input: { taskIds?: string[] }) =>
       ipcRenderer.invoke("desktop:file-manager:get-storage-overview", input) as Promise<StorageOverview>,
-    cleanupOrphans: (input: { cacheDir: string; tasksDir: string; taskIds: string[] }) =>
+    cleanupOrphans: (input: { taskIds: string[] }) =>
       ipcRenderer.invoke("desktop:file-manager:cleanup-orphans", input) as Promise<StorageCleanupResult>,
-    openDirectory: (kind: StorageLocationKind, input: { dataDir: string; cacheDir: string; tasksDir: string }) =>
-      ipcRenderer.invoke("desktop:file-manager:open-directory", kind, input) as Promise<string>,
+    openDirectory: (kind: StorageLocationKind) =>
+      ipcRenderer.invoke("desktop:file-manager:open-directory", kind) as Promise<string>,
   },
 };
 

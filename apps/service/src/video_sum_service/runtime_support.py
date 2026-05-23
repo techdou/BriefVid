@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import importlib
 import json
 import os
 import shutil
@@ -5,26 +8,36 @@ import subprocess
 import sys
 import textwrap
 import venv
-import importlib
+from dataclasses import fields
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
-
-from video_sum_core.pipeline.real import PipelineSettings, RealPipelineRunner
-from video_sum_infra.config import ServiceSettings
+from video_sum_infra.config import (
+    DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT,
+    DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE,
+    DEFAULT_SUMMARY_SYSTEM_PROMPT,
+    DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE,
+    DEFAULT_VISUAL_FRAME_PLANNING_PROMPT,
+    DEFAULT_VISUAL_NOTE_SYSTEM_PROMPT,
+    DEFAULT_VISUAL_NOTE_USER_PROMPT_TEMPLATE,
+    DEFAULT_VISUAL_VLM_PROMPT,
+    ServiceSettings,
+)
 from video_sum_infra.runtime import (
     activate_runtime_pythonpath,
     bootstrap_managed_runtime,
     ffmpeg_location,
     is_frozen,
-    managed_runtime_root,
     managed_runtime_dir,
+    managed_runtime_root,
     prepend_runtime_path,
     read_runtime_metadata,
     repo_root,
     runtime_library_dirs,
     runtime_python_candidates,
     runtime_python_executable,
+    runtime_pythonpath_dirs,
     sanitized_subprocess_dll_search,
     write_runtime_metadata,
 )
@@ -32,10 +45,13 @@ from video_sum_infra.runtime import (
 from video_sum_service.context import logger, settings_manager
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.settings_manager import SettingsUpdatePayload
-from video_sum_service.worker import TaskWorker
+
+if TYPE_CHECKING:
+    from video_sum_service.worker import TaskWorker
 
 _environment_probe_cache: dict[str, dict[str, object]] = {}
 _environment_probe_failures: dict[str, str] = {}
+_ENVIRONMENT_PROBE_CACHE_FILE = "environment-probe-cache.json"
 _PIP_INDEX_CANDIDATES: tuple[tuple[str, str | None], ...] = (
     ("official", None),
     ("tsinghua", "https://pypi.tuna.tsinghua.edu.cn/simple"),
@@ -57,6 +73,9 @@ _RUNTIME_EXTENSION_PACKAGE_KEYS: set[str] = {
     "chromadb",
     "sentence_transformers",
 }
+_RUNTIME_ROOT_APP_DIRS: frozenset[str] = frozenset({"Lib", "lib", "Scripts", "bin", "DLLs", "stdlib"})
+_RUNTIME_ROOT_APP_FILES: frozenset[str] = frozenset({"pythonpath.pth"})
+_RUNTIME_ROOT_STALE_FILES: frozenset[str] = frozenset({"pyvenv.cfg"})
 
 
 def _split_env_urls(raw_value: str | None) -> list[str]:
@@ -102,9 +121,12 @@ def runtime_subprocess_env(runtime_channel: str) -> dict[str, str]:
     env["PYTHONUTF8"] = "1"
 
     path_entries = [str(path) for path in runtime_library_dirs(runtime_channel)]
-    ffmpeg_dir = ffmpeg_location()
-    if ffmpeg_dir is not None:
-        path_entries.append(str(ffmpeg_dir))
+    pythonpath_entries = [str(path) for path in runtime_pythonpath_dirs(runtime_channel)]
+    if pythonpath_entries:
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    ffmpeg_exe = ffmpeg_location()
+    if ffmpeg_exe is not None:
+        path_entries.append(str(ffmpeg_exe.parent))
 
     current_path = env.get("PATH", "")
     inherited_entries: list[str] = []
@@ -175,6 +197,56 @@ def run_host_command(command: list[str], timeout: int = 3600) -> subprocess.Comp
 
 def uses_current_service_python(runtime_channel: str) -> bool:
     return not is_frozen() and runtime_channel == "base"
+
+
+def _environment_probe_cache_path() -> Path:
+    return settings_manager.current.cache_dir / _ENVIRONMENT_PROBE_CACHE_FILE
+
+
+def _read_environment_probe_cache_file() -> dict[str, object]:
+    path = _environment_probe_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("ignore invalid environment probe cache path=%s error=%s", path, exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_environment_probe_cache_file(payload: dict[str, object]) -> None:
+    path = _environment_probe_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("failed to write environment probe cache path=%s error=%s", path, exc)
+
+
+def _load_cached_environment_probe(runtime_channel: str) -> dict[str, object] | None:
+    cached = _environment_probe_cache.get(runtime_channel)
+    if cached is not None:
+        return dict(cached)
+
+    cache_file = _read_environment_probe_cache_file()
+    entry = cache_file.get(runtime_channel)
+    if not isinstance(entry, dict):
+        return None
+    if str(entry.get("runtimeChannel") or runtime_channel) != runtime_channel:
+        return None
+    if entry.get("runtimeReady") and not uses_current_service_python(runtime_channel):
+        if runtime_python_executable(runtime_channel) is None:
+            return None
+    _environment_probe_cache[runtime_channel] = dict(entry)
+    return dict(entry)
+
+
+def _store_cached_environment_probe(runtime_channel: str, payload: dict[str, object]) -> None:
+    _environment_probe_cache[runtime_channel] = dict(payload)
+    cache_file = _read_environment_probe_cache_file()
+    cache_file[runtime_channel] = dict(payload)
+    _write_environment_probe_cache_file(cache_file)
 
 
 def command_error_detail(exc: subprocess.CalledProcessError, fallback: str) -> str:
@@ -284,7 +356,7 @@ def torch_install_with_fallbacks(
         except subprocess.CalledProcessError as exc:
             attempts.append((label, exc))
 
-    raise HTTPException(status_code=500, detail=pip_install_error_detail("CUDA 运行时依赖", attempts))
+    raise HTTPException(status_code=500, detail=pip_install_error_detail("CUDA 运行环境依赖", attempts))
 
 
 def ensure_runtime_pip(python_executable: Path, runtime_channel: str) -> None:
@@ -367,10 +439,7 @@ def ensure_runtime_channel(runtime_channel: str) -> Path | None:
     base_metadata = read_runtime_metadata(base_dir)
     target_metadata = read_runtime_metadata(target_dir)
     target_ready = runtime_python_executable(runtime_channel) is not None
-    target_matches_base = (
-        target_metadata.get("appVersion") == base_metadata.get("appVersion")
-        and target_metadata.get("runtimeLayout") == base_metadata.get("runtimeLayout")
-    )
+    target_matches_base = runtime_metadata_matches_base(target_metadata, base_metadata)
     if target_ready and target_matches_base:
         return target_dir
 
@@ -395,6 +464,7 @@ def inspect_runtime_channels() -> dict[str, object]:
     base_metadata = read_runtime_metadata(base_dir)
     base_app_version = str(base_metadata.get("appVersion") or "")
     base_layout = str(base_metadata.get("runtimeLayout") or "")
+    base_python_version = str(base_metadata.get("pythonVersion") or "")
     channels: list[dict[str, object]] = []
 
     for runtime_channel in sorted(discovered, key=lambda item: (item != "base", item)):
@@ -409,10 +479,7 @@ def inspect_runtime_channels() -> dict[str, object]:
             exists
             and runtime_channel != "base"
             and ready
-            and (
-                (base_app_version and app_version != base_app_version)
-                or (base_layout and layout != base_layout)
-            )
+            and not runtime_metadata_matches_base(metadata, base_metadata)
         )
         channels.append(
             {
@@ -425,6 +492,8 @@ def inspect_runtime_channels() -> dict[str, object]:
                 "runtimeLayout": layout,
                 "targetAppVersion": base_app_version,
                 "targetRuntimeLayout": base_layout,
+                "pythonVersion": str(metadata.get("pythonVersion") or ""),
+                "targetPythonVersion": base_python_version,
                 "needsUpdate": needs_update,
                 "cudaVariant": str(metadata.get("cudaVariant") or ""),
                 "localAsrInstalled": bool(metadata.get("localAsrInstalled")),
@@ -435,6 +504,7 @@ def inspect_runtime_channels() -> dict[str, object]:
     return {
         "baseAppVersion": base_app_version,
         "baseRuntimeLayout": base_layout,
+        "basePythonVersion": base_python_version,
         "pipIndexes": pip_index_options(),
         "channels": channels,
     }
@@ -473,10 +543,21 @@ def sync_all_runtime_channels() -> dict[str, object]:
 
 def sync_runtime_base(target_dir: Path, base_dir: Path, runtime_channel: str) -> None:
     target_metadata = read_runtime_metadata(target_dir)
-    copy_runtime_item(base_dir / "stdlib", target_dir / "stdlib")
-    copy_runtime_item(base_dir / "DLLs", target_dir / "DLLs")
-    sync_runtime_lib(target_dir / "Lib", base_dir / "Lib")
-    sync_runtime_scripts(target_dir / "Scripts", base_dir / "Scripts")
+
+    for item in base_dir.iterdir():
+        if item.name == "video_sum_runtime.json":
+            continue
+        if not runtime_root_item_should_sync(item):
+            continue
+        if item.name in {"Lib", "lib"}:
+            sync_runtime_lib(target_dir / item.name, item)
+            continue
+        if item.name in {"Scripts", "bin"}:
+            sync_runtime_scripts(target_dir / item.name, item)
+            continue
+        copy_runtime_item(item, target_dir / item.name)
+
+    remove_stale_runtime_root_items(target_dir, base_dir)
 
     base_metadata = read_runtime_metadata(base_dir)
     (target_dir / "video_sum_runtime.json").write_text(
@@ -495,6 +576,35 @@ def sync_runtime_base(target_dir: Path, base_dir: Path, runtime_channel: str) ->
     )
 
 
+def runtime_metadata_matches_base(target_metadata: dict[str, object], base_metadata: dict[str, object]) -> bool:
+    return (
+        target_metadata.get("appVersion") == base_metadata.get("appVersion")
+        and target_metadata.get("runtimeLayout") == base_metadata.get("runtimeLayout")
+        and target_metadata.get("pythonVersion") == base_metadata.get("pythonVersion")
+    )
+
+
+def runtime_root_item_should_sync(item: Path) -> bool:
+    name = item.name
+    lower_name = name.lower()
+    if name in _RUNTIME_ROOT_APP_DIRS or name in _RUNTIME_ROOT_APP_FILES:
+        return True
+    if lower_name in {"python.exe", "pythonw.exe", "python3.dll"}:
+        return True
+    if lower_name.startswith("python") and (lower_name.endswith(".dll") or lower_name.endswith("._pth")):
+        return True
+    if lower_name.startswith("vcruntime") and lower_name.endswith(".dll"):
+        return True
+    return False
+
+
+def remove_stale_runtime_root_items(target_dir: Path, base_dir: Path) -> None:
+    for name in _RUNTIME_ROOT_STALE_FILES:
+        target = target_dir / name
+        if target.exists():
+            target.unlink()
+
+
 def sync_runtime_scripts(target_scripts_dir: Path, base_scripts_dir: Path) -> None:
     if not base_scripts_dir.exists():
         return
@@ -511,6 +621,9 @@ def sync_runtime_lib(target_lib_dir: Path, base_lib_dir: Path) -> None:
     for item in base_lib_dir.iterdir():
         if item.name == "site-packages":
             sync_runtime_site_packages(target_lib_dir / "site-packages", item)
+            continue
+        if item.is_dir() and (item / "site-packages").exists():
+            sync_runtime_lib(target_lib_dir / item.name, item)
             continue
         copy_runtime_item(item, target_lib_dir / item.name)
 
@@ -568,7 +681,7 @@ def copy_runtime_item(source: Path, target: Path) -> None:
 
 def detect_environment(runtime_channel: str | None = None) -> dict[str, object]:
     active_channel = runtime_channel or settings_manager.current.runtime_channel
-    cached = _environment_probe_cache.get(active_channel)
+    cached = _load_cached_environment_probe(active_channel)
     if cached is not None:
         return dict(cached)
 
@@ -601,7 +714,7 @@ def detect_environment(runtime_channel: str | None = None) -> dict[str, object]:
                 "runtimeReady": False,
                 "runtimePython": "",
             }
-            _environment_probe_cache[active_channel] = dict(payload)
+            _store_cached_environment_probe(active_channel, payload)
             return payload
 
     script = textwrap.dedent(
@@ -658,12 +771,14 @@ def detect_environment(runtime_channel: str | None = None) -> dict[str, object]:
         """
     ).strip()
 
+    probe_failed = False
     try:
         result = probe_runner([str(python_executable), "-c", script], timeout=120)
         payload = json.loads(result.stdout.strip() or "{}")
         payload["ffmpegLocation"] = str(ffmpeg_location() or "")
         _environment_probe_failures.pop(active_channel, None)
     except Exception as exc:
+        probe_failed = True
         failure_detail = (exc.stderr or exc.stdout or str(exc)).strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
         if _environment_probe_failures.get(active_channel) != failure_detail:
             logger.warning(
@@ -697,7 +812,10 @@ def detect_environment(runtime_channel: str | None = None) -> dict[str, object]:
     payload.update(
         {
             "runtimeChannel": active_channel,
-            "runtimeReady": uses_current_service_python(active_channel) or runtime_python_executable(active_channel) is not None,
+            "runtimeReady": (
+                not probe_failed
+                and (uses_current_service_python(active_channel) or runtime_python_executable(active_channel) is not None)
+            ),
             "runtimePython": str(python_executable),
             "ffmpegLocation": str(ffmpeg_location() or ""),
         }
@@ -711,7 +829,7 @@ def detect_environment(runtime_channel: str | None = None) -> dict[str, object]:
     payload["sentenceTransformersVersion"] = str(payload.get("sentenceTransformersVersion") or "")
     payload["knowledgeDependenciesReady"] = bool(payload.get("knowledgeDependenciesReady"))
     payload["runtimeError"] = str(payload.get("runtimeError") or "")
-    _environment_probe_cache[active_channel] = dict(payload)
+    _store_cached_environment_probe(active_channel, payload)
     return payload
 
 
@@ -719,9 +837,18 @@ def clear_environment_probe_cache(runtime_channel: str | None = None) -> None:
     if runtime_channel is None:
         _environment_probe_cache.clear()
         _environment_probe_failures.clear()
+        path = _environment_probe_cache_path()
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("failed to remove environment probe cache path=%s", path)
         return
     _environment_probe_cache.pop(runtime_channel, None)
     _environment_probe_failures.pop(runtime_channel, None)
+    cache_file = _read_environment_probe_cache_file()
+    if runtime_channel in cache_file:
+        cache_file.pop(runtime_channel, None)
+        _write_environment_probe_cache_file(cache_file)
 
 
 def build_worker(
@@ -729,6 +856,10 @@ def build_worker(
     current_settings: ServiceSettings,
     environment_info: dict[str, object] | None = None,
 ) -> TaskWorker:
+    from video_sum_core.pipeline.real import PipelineSettings, RealPipelineRunner
+
+    from video_sum_service.worker import TaskWorker
+
     selected_runtime_channel = current_settings.runtime_channel
     if selected_runtime_channel != "base" and runtime_python_executable(selected_runtime_channel) is None:
         logger.warning("runtime channel %s is not ready, falling back to base", selected_runtime_channel)
@@ -739,36 +870,74 @@ def build_worker(
     activate_runtime_pythonpath(selected_runtime_channel)
     environment = environment_info or detect_environment(selected_runtime_channel)
     runtime_settings = current_settings.with_resolved_runtime(cuda_available=bool(environment.get("cudaAvailable")))
+    pipeline_settings_payload = {
+        "tasks_dir": runtime_settings.tasks_dir,
+        "runtime_channel": selected_runtime_channel,
+        "transcription_provider": runtime_settings.transcription_provider,
+        "whisper_model": runtime_settings.whisper_model,
+        "whisper_device": runtime_settings.whisper_device,
+        "whisper_compute_type": runtime_settings.whisper_compute_type,
+        "local_asr_available": bool(environment.get("localAsrAvailable")),
+        "siliconflow_asr_base_url": runtime_settings.siliconflow_asr_base_url,
+        "siliconflow_asr_model": runtime_settings.siliconflow_asr_model,
+        "siliconflow_asr_api_key": runtime_settings.siliconflow_asr_api_key,
+        "siliconflow_asr_chunk_duration_seconds": runtime_settings.siliconflow_asr_chunk_duration_seconds,
+        "siliconflow_asr_concurrency": runtime_settings.siliconflow_asr_concurrency,
+        "multimodal_asr_base_url": runtime_settings.multimodal_asr_base_url,
+        "multimodal_asr_model": runtime_settings.multimodal_asr_model,
+        "multimodal_asr_api_key": runtime_settings.multimodal_asr_api_key,
+        "multimodal_asr_chunk_duration_seconds": runtime_settings.multimodal_asr_chunk_duration_seconds,
+        "multimodal_asr_max_retries": runtime_settings.multimodal_asr_max_retries,
+        "llm_enabled": runtime_settings.llm_enabled,
+        "llm_provider": runtime_settings.llm_provider,
+        "llm_api_key": runtime_settings.llm_api_key,
+        "llm_base_url": runtime_settings.llm_base_url,
+        "llm_model": runtime_settings.llm_model,
+        "visual_evidence_enabled": runtime_settings.visual_evidence_enabled,
+        "visual_note_mode": runtime_settings.visual_note_mode,
+        "visual_multimodal_enabled": runtime_settings.visual_multimodal_enabled,
+        "visual_download_resolution": runtime_settings.visual_download_resolution,
+        "visual_evidence_use_llm": runtime_settings.visual_evidence_use_llm and runtime_settings.visual_multimodal_enabled,
+        "visual_vlm_provider": runtime_settings.visual_vlm_provider,
+        "visual_evidence_base_url": runtime_settings.visual_evidence_base_url,
+        "visual_evidence_model": runtime_settings.visual_evidence_model,
+        "visual_evidence_api_key": runtime_settings.visual_evidence_api_key,
+        "visual_evidence_max_frames": runtime_settings.visual_evidence_max_frames,
+        "visual_evidence_frame_interval_seconds": runtime_settings.visual_evidence_frame_interval_seconds,
+        "visual_evidence_frame_width": runtime_settings.visual_evidence_frame_width,
+        "visual_evidence_image_quality": runtime_settings.visual_evidence_image_quality,
+        "visual_evidence_timeout_seconds": runtime_settings.visual_evidence_timeout_seconds,
+        "visual_evidence_retry_count": runtime_settings.visual_evidence_retry_count,
+        "visual_note_system_prompt": runtime_settings.visual_note_system_prompt,
+        "visual_note_user_prompt_template": runtime_settings.visual_note_user_prompt_template,
+        "visual_frame_planning_prompt": runtime_settings.visual_frame_planning_prompt,
+        "visual_vlm_prompt": runtime_settings.visual_vlm_prompt,
+        "summary_system_prompt": runtime_settings.summary_system_prompt,
+        "summary_user_prompt_template": runtime_settings.summary_user_prompt_template,
+        "knowledge_note_system_prompt": runtime_settings.knowledge_note_system_prompt,
+        "knowledge_note_user_prompt_template": runtime_settings.knowledge_note_user_prompt_template,
+        "mindmap_system_prompt": runtime_settings.mindmap_system_prompt,
+        "mindmap_user_prompt_template": runtime_settings.mindmap_user_prompt_template,
+        "summary_chunk_target_chars": runtime_settings.summary_chunk_target_chars,
+        "summary_chunk_overlap_segments": runtime_settings.summary_chunk_overlap_segments,
+        "summary_chunk_concurrency": runtime_settings.summary_chunk_concurrency,
+        "summary_chunk_retry_count": runtime_settings.summary_chunk_retry_count,
+        "ytdlp_cookies_file": runtime_settings.ytdlp_cookies_file,
+        "ytdlp_cookies_browser": runtime_settings.ytdlp_cookies_browser,
+    }
+    supported_pipeline_fields = {field.name for field in fields(PipelineSettings)}
     pipeline_settings = PipelineSettings(
-        tasks_dir=runtime_settings.tasks_dir,
-        runtime_channel=selected_runtime_channel,
-        transcription_provider=runtime_settings.transcription_provider,
-        whisper_model=runtime_settings.whisper_model,
-        whisper_device=runtime_settings.whisper_device,
-        whisper_compute_type=runtime_settings.whisper_compute_type,
-        local_asr_available=bool(environment.get("localAsrAvailable")),
-        siliconflow_asr_base_url=runtime_settings.siliconflow_asr_base_url,
-        siliconflow_asr_model=runtime_settings.siliconflow_asr_model,
-        siliconflow_asr_api_key=runtime_settings.siliconflow_asr_api_key,
-        llm_enabled=runtime_settings.llm_enabled,
-        llm_api_key=runtime_settings.llm_api_key,
-        llm_base_url=runtime_settings.llm_base_url,
-        llm_model=runtime_settings.llm_model,
-        summary_system_prompt=runtime_settings.summary_system_prompt,
-        summary_user_prompt_template=runtime_settings.summary_user_prompt_template,
-        mindmap_system_prompt=runtime_settings.mindmap_system_prompt,
-        mindmap_user_prompt_template=runtime_settings.mindmap_user_prompt_template,
-        summary_chunk_target_chars=runtime_settings.summary_chunk_target_chars,
-        summary_chunk_overlap_segments=runtime_settings.summary_chunk_overlap_segments,
-        summary_chunk_concurrency=runtime_settings.summary_chunk_concurrency,
-        summary_chunk_retry_count=runtime_settings.summary_chunk_retry_count,
-        ytdlp_cookies_file=runtime_settings.ytdlp_cookies_file,
-        ytdlp_cookies_browser=runtime_settings.ytdlp_cookies_browser,
+        **{
+            key: value
+            for key, value in pipeline_settings_payload.items()
+            if key in supported_pipeline_fields
+        }
     )
     return TaskWorker(
         repository=repository,
         pipeline_runner=RealPipelineRunner(pipeline_settings),
         auto_generate_mindmap=current_settings.auto_generate_mindmap,
+        auto_generate_visual_evidence=current_settings.visual_evidence_enabled and current_settings.visual_note_mode != "text",
         knowledge_index_auto_rebuild=(
             current_settings.knowledge_index_auto_rebuild
             if current_settings.knowledge_enabled
@@ -781,10 +950,12 @@ def build_worker(
 
 
 def replace_task_worker(app_state, next_worker: TaskWorker) -> TaskWorker:
+    from video_sum_service.worker import TaskWorker
+
     previous_worker = getattr(app_state, "task_worker", None)
     app_state.task_worker = next_worker
     if isinstance(previous_worker, TaskWorker):
-        previous_worker.close_for_new_work()
+        previous_worker.shutdown(wait=False, cancel_pending=True)
     return next_worker
 
 
@@ -811,8 +982,12 @@ def serialize_settings(
         "fixed_model": current_settings.fixed_model,
         "siliconflow_asr_base_url": current_settings.siliconflow_asr_base_url,
         "siliconflow_asr_model": current_settings.siliconflow_asr_model,
-        "siliconflow_asr_api_key": current_settings.siliconflow_asr_api_key,
+        "siliconflow_asr_api_key": "",
         "siliconflow_asr_api_key_configured": bool(current_settings.siliconflow_asr_api_key),
+        "multimodal_asr_base_url": current_settings.multimodal_asr_base_url,
+        "multimodal_asr_model": current_settings.multimodal_asr_model,
+        "multimodal_asr_api_key": "",
+        "multimodal_asr_api_key_configured": bool(current_settings.multimodal_asr_api_key),
         "cuda_variant": current_settings.cuda_variant,
         "runtime_channel": current_settings.runtime_channel,
         "output_dir": str(current_settings.output_dir),
@@ -820,23 +995,48 @@ def serialize_settings(
         "enable_cache": current_settings.enable_cache,
         "language": current_settings.language,
         "summary_mode": current_settings.summary_mode,
+        "prompt_router_mode": current_settings.prompt_router_mode,
+        "prompt_presets_path": current_settings.prompt_presets_path,
         "llm_enabled": current_settings.llm_enabled,
         "auto_generate_mindmap": current_settings.auto_generate_mindmap,
+        "visual_note_mode": current_settings.visual_note_mode,
+        "visual_evidence_enabled": current_settings.visual_evidence_enabled,
+        "visual_multimodal_enabled": current_settings.visual_multimodal_enabled,
+        "visual_download_resolution": current_settings.visual_download_resolution,
+        "visual_evidence_use_llm": current_settings.visual_evidence_use_llm,
+        "visual_vlm_provider": current_settings.visual_vlm_provider,
+        "visual_evidence_base_url": current_settings.visual_evidence_base_url,
+        "visual_evidence_model": current_settings.visual_evidence_model,
+        "visual_evidence_api_key": "",
+        "visual_evidence_api_key_configured": bool(current_settings.visual_evidence_api_key),
+        "visual_evidence_max_frames": current_settings.visual_evidence_max_frames,
+        "visual_evidence_frame_interval_seconds": current_settings.visual_evidence_frame_interval_seconds,
+        "visual_evidence_frame_width": current_settings.visual_evidence_frame_width,
+        "visual_evidence_image_quality": current_settings.visual_evidence_image_quality,
+        "visual_evidence_timeout_seconds": current_settings.visual_evidence_timeout_seconds,
+        "visual_evidence_retry_count": current_settings.visual_evidence_retry_count,
         "llm_provider": current_settings.llm_provider,
         "llm_base_url": current_settings.llm_base_url,
         "llm_model": current_settings.llm_model,
-        "llm_api_key": current_settings.llm_api_key,
+        "llm_api_key": "",
         "llm_api_key_configured": bool(current_settings.llm_api_key),
         "knowledge_llm_mode": current_settings.knowledge_llm_mode,
         "knowledge_llm_enabled": current_settings.knowledge_llm_enabled,
+        "knowledge_llm_provider": current_settings.knowledge_llm_provider,
         "knowledge_llm_base_url": current_settings.knowledge_llm_base_url,
         "knowledge_llm_model": current_settings.knowledge_llm_model,
-        "knowledge_llm_api_key": current_settings.knowledge_llm_api_key,
+        "knowledge_llm_api_key": "",
         "knowledge_llm_api_key_configured": bool(current_settings.knowledge_llm_api_key),
         "knowledge_enabled": current_settings.knowledge_enabled,
         "knowledge_index_auto_rebuild": current_settings.knowledge_index_auto_rebuild,
         "summary_system_prompt": current_settings.summary_system_prompt,
         "summary_user_prompt_template": current_settings.summary_user_prompt_template,
+        "knowledge_note_system_prompt": current_settings.knowledge_note_system_prompt,
+        "knowledge_note_user_prompt_template": current_settings.knowledge_note_user_prompt_template,
+        "visual_note_system_prompt": current_settings.visual_note_system_prompt,
+        "visual_note_user_prompt_template": current_settings.visual_note_user_prompt_template,
+        "visual_frame_planning_prompt": current_settings.visual_frame_planning_prompt,
+        "visual_vlm_prompt": current_settings.visual_vlm_prompt,
         "summary_chunk_target_chars": current_settings.summary_chunk_target_chars,
         "summary_chunk_overlap_segments": current_settings.summary_chunk_overlap_segments,
         "task_concurrency": current_settings.task_concurrency,
@@ -846,6 +1046,16 @@ def serialize_settings(
         "ytdlp_cookies_file": current_settings.ytdlp_cookies_file,
         "ytdlp_cookies_browser": current_settings.ytdlp_cookies_browser,
         "settings_file_exists": settings_manager.has_persisted_settings,
+        "defaults": {
+            "knowledge_note_system_prompt": DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT,
+            "knowledge_note_user_prompt_template": DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE,
+            "visual_note_system_prompt": DEFAULT_VISUAL_NOTE_SYSTEM_PROMPT,
+            "visual_note_user_prompt_template": DEFAULT_VISUAL_NOTE_USER_PROMPT_TEMPLATE,
+            "visual_frame_planning_prompt": DEFAULT_VISUAL_FRAME_PLANNING_PROMPT,
+            "visual_vlm_prompt": DEFAULT_VISUAL_VLM_PROMPT,
+            "summary_system_prompt": DEFAULT_SUMMARY_SYSTEM_PROMPT,
+            "summary_user_prompt_template": DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE,
+        },
     }
 
 

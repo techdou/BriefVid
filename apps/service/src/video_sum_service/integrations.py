@@ -1,18 +1,101 @@
+import base64
+import binascii
+import importlib.resources
 import io
 import json
+import os
+from pathlib import Path
+import struct
 import wave
+import zlib
 
 import httpx
 from fastapi import HTTPException
 
 from video_sum_infra.config import ServiceSettings
+from video_sum_infra.llm import (
+    ANTHROPIC_API_VERSION,
+    anthropic_messages_url,
+    build_anthropic_messages_payload,
+    extract_llm_message_content,
+    is_anthropic_llm,
+    normalize_openai_compatible_model_name,
+    normalize_llm_provider,
+    openai_chat_completions_url,
+)
 from video_sum_infra.runtime import service_log_path
 
 from video_sum_service.context import COVER_CACHE_DIR, settings_manager
-from video_sum_service.settings_manager import SettingsUpdatePayload
+from video_sum_service.settings_manager import SettingsUpdatePayload, is_blank_or_masked_secret
 
 MAX_LOG_CHARS = 20_000
 MAX_LOG_LINE_CHARS = 1_000
+
+VISUAL_TEST_FONT: dict[str, tuple[str, ...]] = {
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+}
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", binascii.crc32(chunk_type + data) & 0xFFFFFFFF)
+    )
+
+
+def build_visual_test_image_data_url() -> str:
+    width, height = 320, 160
+    white = (255, 255, 255)
+    ink = (22, 24, 28)
+    pink = (251, 114, 153)
+    pixels = bytearray(white * width * height)
+
+    def set_pixel(x: int, y: int, color: tuple[int, int, int]) -> None:
+        if 0 <= x < width and 0 <= y < height:
+            offset = (y * width + x) * 3
+            pixels[offset : offset + 3] = bytes(color)
+
+    center_x, center_y, radius = 262, 80, 38
+    for y in range(center_y - radius, center_y + radius + 1):
+        for x in range(center_x - radius, center_x + radius + 1):
+            if (x - center_x) ** 2 + (y - center_y) ** 2 <= radius**2:
+                set_pixel(x, y, pink)
+
+    scale = 11
+    cursor_x = 26
+    top = 48
+    for char in "BILISUM":
+        glyph = VISUAL_TEST_FONT[char]
+        for row_index, row in enumerate(glyph):
+            for col_index, value in enumerate(row):
+                if value != "1":
+                    continue
+                for dy in range(scale):
+                    for dx in range(scale):
+                        set_pixel(cursor_x + col_index * scale + dx, top + row_index * scale + dy, ink)
+        cursor_x += 6 * scale
+
+    raw = bytearray()
+    stride = width * 3
+    for row in range(height):
+        raw.append(0)
+        start = row * stride
+        raw.extend(pixels[start : start + stride])
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), level=9))
+        + _png_chunk(b"IEND", b"")
+    )
+    return f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
 
 
 def trim_log_text(content: str, *, max_chars: int = MAX_LOG_CHARS, max_line_chars: int = MAX_LOG_LINE_CHARS) -> str:
@@ -80,32 +163,6 @@ def extract_http_error_detail(response: httpx.Response) -> str:
     return text or f"HTTP {response.status_code}"
 
 
-def extract_llm_message_content(body: dict[str, object] | None) -> str:
-    if not isinstance(body, dict):
-        return ""
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    first = choices[0]
-    if not isinstance(first, dict):
-        return ""
-    message = first.get("message")
-    if not isinstance(message, dict):
-        return ""
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    text_parts.append(text.strip())
-        return "\n".join(text_parts).strip()
-    return ""
-
-
 def build_test_wav_bytes(duration_ms: int = 250, sample_rate: int = 16000) -> bytes:
     frame_count = max(1, int(sample_rate * duration_ms / 1000))
     buffer = io.BytesIO()
@@ -117,16 +174,73 @@ def build_test_wav_bytes(duration_ms: int = 250, sample_rate: int = 16000) -> by
     return buffer.getvalue()
 
 
-def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[str, object]:
+def load_builtin_asr_test_audio() -> tuple[str, bytes, str]:
+    audio = importlib.resources.files("video_sum_service.assets").joinpath("asr_test_zh.wav")
+    return "bilisum-asr-test-zh.wav", audio.read_bytes(), "audio/wav"
+
+
+def load_asr_test_audio() -> tuple[str, bytes, str]:
+    audio_path = os.environ.get("VIDEO_SUM_ASR_TEST_AUDIO_FILE", "").strip()
+    if audio_path:
+        path = Path(audio_path).expanduser()
+        if not path.is_file():
+            raise HTTPException(status_code=400, detail=f"ASR 测试音频不存在：{path}")
+        suffix = path.suffix.lower()
+        content_type = {
+            ".flac": "audio/flac",
+            ".m4a": "audio/mp4",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".wav": "audio/wav",
+            ".webm": "audio/webm",
+        }.get(suffix, "application/octet-stream")
+        return path.name, path.read_bytes(), content_type
+
+    try:
+        return load_builtin_asr_test_audio()
+    except (FileNotFoundError, ModuleNotFoundError):
+        return "bilisum-asr-test.wav", build_test_wav_bytes(), "audio/wav"
+
+
+def build_effective_llm_test_settings(payload: SettingsUpdatePayload | None = None) -> ServiceSettings:
     current_settings = settings_manager.current
-    updates = payload.model_dump(exclude_none=True) if payload is not None else {}
-    effective_settings = ServiceSettings.model_validate(
-        {**current_settings.model_dump(mode="json"), **updates}
-    )
+    current_dump = current_settings.model_dump(mode="json")
+    if payload is not None and payload.llm_test_scope == "knowledge":
+        current_dump = {
+            **current_dump,
+            "llm_enabled": current_settings.knowledge_llm_enabled,
+            "llm_provider": current_settings.knowledge_llm_provider,
+            "llm_base_url": current_settings.knowledge_llm_base_url,
+            "llm_api_key": current_settings.knowledge_llm_api_key,
+            "llm_model": current_settings.knowledge_llm_model,
+        }
+    if payload is not None and payload.llm_test_scope == "visual":
+        provider = current_settings.visual_vlm_provider or current_settings.llm_provider
+        base_url = current_settings.visual_evidence_base_url or current_settings.llm_base_url
+        current_dump = {
+            **current_dump,
+            "llm_enabled": current_settings.visual_multimodal_enabled,
+            "llm_provider": provider,
+            "llm_base_url": base_url,
+            "llm_api_key": current_settings.visual_evidence_api_key or current_settings.llm_api_key,
+            "llm_model": current_settings.visual_evidence_model or current_settings.llm_model,
+        }
+    updates = payload.model_dump(exclude_none=True, exclude={"llm_test_scope"}) if payload is not None else {}
+    if "llm_api_key" in updates and is_blank_or_masked_secret(updates["llm_api_key"]) and current_dump.get("llm_api_key"):
+        updates.pop("llm_api_key")
+    return ServiceSettings.model_validate({**current_dump, **updates})
+
+
+def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[str, object]:
+    effective_settings = build_effective_llm_test_settings(payload)
+    test_scope = payload.llm_test_scope if payload and payload.llm_test_scope else "main"
 
     base_url = str(effective_settings.llm_base_url or "").strip().rstrip("/")
     api_key = str(effective_settings.llm_api_key or "").strip()
     model = str(effective_settings.llm_model or "").strip()
+    provider = normalize_llm_provider(effective_settings.llm_provider)
+    use_anthropic = is_anthropic_llm(provider, base_url)
+    request_model = model if use_anthropic else normalize_openai_compatible_model_name(model)
 
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写 API Base URL。")
@@ -135,35 +249,99 @@ def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
     if not model:
         raise HTTPException(status_code=400, detail="请先填写模型名称。")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    request_payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是一个 JSON 测试助手。你只能返回合法 JSON，不能输出任何额外文字。",
-            },
-            {
-                "role": "user",
-                "content": (
-                    "请只返回一个合法 JSON 对象，不要带 markdown 代码块，不要带解释。"
-                    '格式必须是：{"ok":true,"message":"test"}'
-                ),
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 64,
-    }
+    if test_scope == "visual":
+        request_payload = {
+            "model": request_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是一个视觉 JSON 测试助手。你必须观察图片，只返回合法 JSON。",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "请识别图片中的大字文本和主要形状。只返回 JSON，不要解释。"
+                                '格式：{"ok":true,"text":"BILISUM","shape":"pink circle"}'
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": build_visual_test_image_data_url(),
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 96,
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+    else:
+        request_payload = {
+            "model": request_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是一个 JSON 测试助手。你只能返回合法 JSON，不能输出任何额外文字。",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "请只返回一个合法 JSON 对象，不要带 markdown 代码块，不要带解释。"
+                        '格式必须是：{"ok":true,"message":"test"}'
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "max_tokens": 64,
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+    # For visual tests with images, only the real Anthropic API supports image
+    # blocks via /messages. Third-party Anthropic-compatible endpoints
+    # (SiliconFlow etc.) need OpenAI format for image requests.
+    fallback_to_openai_for_images = (
+        use_anthropic and test_scope == "visual" and "api.anthropic.com" not in base_url.lower()
+    )
+    if fallback_to_openai_for_images:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        request_url = openai_chat_completions_url(base_url)
+        request_json = request_payload
+        request_json["model"] = normalize_openai_compatible_model_name(model)
+    elif use_anthropic:
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "Content-Type": "application/json",
+        }
+        request_url = anthropic_messages_url(base_url)
+        request_json = build_anthropic_messages_payload(request_payload)
+    else:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        request_url = openai_chat_completions_url(base_url)
+        request_json = request_payload
 
+    probe_timeout = 120 if test_scope == "visual" else 30
     try:
-        with httpx.Client(timeout=20, follow_redirects=True) as client:
+        with httpx.Client(timeout=probe_timeout, follow_redirects=True) as client:
             response = client.post(
-                f"{base_url}/chat/completions",
+                request_url,
                 headers=headers,
-                json=request_payload,
+                json=request_json,
             )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"LLM 连接失败：{exc}") from exc
@@ -192,14 +370,27 @@ def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
             detail=f"LLM 测试失败：接口可访问，但当前模型未返回合法 JSON。{exc.msg}",
         ) from exc
 
+    if test_scope == "visual":
+        parsed_text = json.dumps(parsed_json, ensure_ascii=False).lower()
+        if "bilisum" not in parsed_text and "bili" not in parsed_text:
+            raise HTTPException(
+                status_code=502,
+                detail="视觉模型测试失败：接口返回了 JSON，但未识别出测试图片中的 BiliSum 文本。",
+            )
+
     preview = preview[:200]
     return {
         "ok": True,
-        "message": f"LLM 连接与 JSON 输出测试成功：{model}",
+        "message": (
+            f"视觉模型图片识别测试成功：{model}"
+            if test_scope == "visual"
+            else f"LLM 连接与 JSON 输出测试成功：{model}"
+        ),
         "model": model,
         "baseUrl": base_url,
         "responsePreview": preview,
         "jsonOutputAvailable": True,
+        "visualImageRecognitionAvailable": test_scope == "visual",
         "jsonPreview": json.dumps(parsed_json, ensure_ascii=False)[:200],
     }
 
@@ -207,9 +398,26 @@ def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
 def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[str, object]:
     current_settings = settings_manager.current
     updates = payload.model_dump(exclude_none=True) if payload is not None else {}
+    if (
+        "siliconflow_asr_api_key" in updates
+        and is_blank_or_masked_secret(updates["siliconflow_asr_api_key"])
+        and current_settings.siliconflow_asr_api_key
+    ):
+        updates.pop("siliconflow_asr_api_key")
+    if (
+        "multimodal_asr_api_key" in updates
+        and is_blank_or_masked_secret(updates["multimodal_asr_api_key"])
+        and current_settings.multimodal_asr_api_key
+    ):
+        updates.pop("multimodal_asr_api_key")
     effective_settings = ServiceSettings.model_validate(
         {**current_settings.model_dump(mode="json"), **updates}
     )
+
+    provider = str(effective_settings.transcription_provider or "").strip().lower()
+
+    if provider == "multimodal":
+        return _probe_multimodal_asr(effective_settings)
 
     base_url = str(effective_settings.siliconflow_asr_base_url or "").strip().rstrip("/")
     api_key = str(effective_settings.siliconflow_asr_api_key or "").strip()
@@ -224,7 +432,7 @@ def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
 
     headers = {"Authorization": f"Bearer {api_key}"}
     request_url = f"{base_url}/audio/transcriptions"
-    audio_bytes = build_test_wav_bytes()
+    audio_name, audio_bytes, audio_content_type = load_asr_test_audio()
 
     try:
         timeout = httpx.Timeout(connect=20.0, read=90.0, write=90.0, pool=20.0)
@@ -233,7 +441,7 @@ def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
                 request_url,
                 headers=headers,
                 data={"model": model},
-                files={"file": ("bilisum-asr-test.wav", audio_bytes, "audio/wav")},
+                files={"file": (audio_name, audio_bytes, audio_content_type)},
             )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"ASR 连接失败：{exc}") from exc
@@ -257,6 +465,89 @@ def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
             f"ASR 连接测试成功：{model}"
             if transcript
             else f"ASR 连接测试成功：{model}（接口已响应，但测试音频未返回文本）"
+        ),
+        "model": model,
+        "baseUrl": base_url,
+        "responsePreview": transcript[:120],
+    }
+
+
+def _probe_multimodal_asr(settings: ServiceSettings) -> dict[str, object]:
+    import base64
+
+    base_url = str(settings.multimodal_asr_base_url or "").strip().rstrip("/")
+    api_key = str(settings.multimodal_asr_api_key or "").strip()
+    model = str(settings.multimodal_asr_model or "").strip()
+
+    if not base_url:
+        raise HTTPException(status_code=400, detail="请先填写多模态 ASR Base URL。")
+    if not model:
+        raise HTTPException(status_code=400, detail="请先填写多模态 ASR 模型名称。")
+
+    request_url = f"{base_url}/chat/completions"
+    audio_bytes = build_test_wav_bytes()
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": f"data:audio/wav;base64,{audio_b64}",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "请转录这段音频的全部文字内容，保持原文，不要修改",
+                    },
+                ],
+            }
+        ],
+        "max_completion_tokens": 1024,
+    }
+
+    try:
+        timeout = httpx.Timeout(connect=20.0, read=90.0, write=90.0, pool=20.0)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(request_url, headers=headers, json=payload)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"多模态 ASR 连接失败：{exc}") from exc
+
+    if response.status_code in {401, 403}:
+        detail = extract_http_error_detail(response)
+        raise HTTPException(status_code=response.status_code, detail=f"多模态 ASR 测试失败：认证失败，{detail}")
+    if response.status_code >= 400:
+        detail = extract_http_error_detail(response)
+        raise HTTPException(status_code=response.status_code, detail=f"多模态 ASR 测试失败：{detail}")
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    transcript = ""
+    if isinstance(body, dict):
+        choices = body.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            transcript = str(message.get("content") or "").strip()
+            if not transcript:
+                transcript = str(message.get("reasoning_content") or "").strip()
+
+    return {
+        "ok": True,
+        "message": (
+            f"多模态 ASR 连接测试成功：{model}"
+            if transcript
+            else f"多模态 ASR 连接测试成功：{model}（接口已响应，但测试音频未返回文本）"
         ),
         "model": model,
         "baseUrl": base_url,

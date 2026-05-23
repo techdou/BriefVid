@@ -363,6 +363,22 @@ class SqliteTaskRepository:
             ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def list_recoverable_tasks(self) -> list[TaskRecord]:
+        with self._lock, sqlite_cursor(self._connection) as cursor:
+            rows = cursor.execute(
+                """
+                SELECT
+                    t.task_id, t.video_id, t.status, t.task_input_json, t.page_number, t.page_title,
+                    NULL AS result_json, t.error_code,
+                    t.error_message, t.created_at, t.updated_at
+                FROM tasks t
+                WHERE t.status IN (?, ?)
+                ORDER BY t.created_at ASC, t.task_id ASC
+                """,
+                (TaskStatus.QUEUED.value, TaskStatus.RUNNING.value),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def list_tasks_for_video(self, video_id: str) -> list[TaskRecord]:
         with self._lock, sqlite_cursor(self._connection) as cursor:
             asset_row = cursor.execute(

@@ -206,7 +206,7 @@
 }
 
 .input-field-with-action {
-  padding-right: 54px;
+  padding-right: 118px;
 }
 
 .input-inline-action {
@@ -214,24 +214,35 @@
   top: 50%;
   right: 10px;
   z-index: 1;
-  width: 34px;
+  min-width: 92px;
   height: 34px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 6px;
+  padding: 0 2px 0 8px;
   border: none;
-  border-radius: 12px;
+  border-radius: 8px;
   background: transparent;
   color: var(--text-tertiary);
+  font-size: 0.82rem;
+  font-weight: 700;
+  white-space: nowrap;
   transform: translateY(-50%);
-  transition: background-color var(--transition-fast), color var(--transition-fast), transform var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    transform var(--transition-fast);
 }
 
 .input-inline-action:hover,
 .input-inline-action:focus-visible {
-  background: var(--bg-subtle);
   color: var(--text-primary);
+  background: transparent;
+}
+
+.input-inline-action:focus-visible {
   outline: none;
+  box-shadow: 0 0 0 3px var(--bg-accent);
 }
 
 .input-inline-action:active {
@@ -239,8 +250,30 @@
 }
 
 .input-inline-action svg {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.input-inline-action-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.local-media-input.is-drag-active .input-field {
+  border-color: var(--brand-500);
+  background: var(--bg-accent);
+  box-shadow: 0 0 0 3px var(--bg-accent-strong);
+}
+
+.local-media-input.is-drag-active .input-icon,
+.local-media-input.is-drag-active .input-inline-action {
+  color: var(--brand-700);
+}
+
+.local-media-input.is-drag-active .input-inline-action {
+  background: transparent;
 }
 
 .input-icon {

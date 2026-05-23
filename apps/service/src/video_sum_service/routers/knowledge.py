@@ -4,14 +4,13 @@ import asyncio
 import json
 from queue import Empty, Queue
 from threading import BoundedSemaphore, Event, Thread
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from video_sum_service.context import settings_manager
 from video_sum_service.runtime_support import detect_environment
-from video_sum_service.knowledge import KnowledgeIndexService, RagService, TagService
-from video_sum_service.knowledge.local_llm import knowledge_llm_available
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.schemas import (
     KnowledgeAskRequest,
@@ -27,6 +26,11 @@ from video_sum_service.schemas import (
     TagListResponse,
     VideoTagListResponse,
 )
+
+if TYPE_CHECKING:
+    from video_sum_service.knowledge.index_service import KnowledgeIndexService
+    from video_sum_service.knowledge.rag_service import RagService
+    from video_sum_service.knowledge.tag_service import TagService
 
 router = APIRouter(prefix="/api/v1/knowledge")
 _QUEUE_TIMEOUT = object()
@@ -51,6 +55,7 @@ def _knowledge_settings_signature(settings) -> tuple[object, ...]:
         str(settings.llm_api_key or ""),
         str(getattr(settings, "knowledge_llm_mode", "same_as_main") or "same_as_main"),
         bool(getattr(settings, "knowledge_llm_enabled", False)),
+        str(getattr(settings, "knowledge_llm_provider", "openai-compatible") or "openai-compatible"),
         str(getattr(settings, "knowledge_llm_base_url", "") or ""),
         str(getattr(settings, "knowledge_llm_model", "") or ""),
         str(getattr(settings, "knowledge_llm_api_key", "") or ""),
@@ -58,6 +63,10 @@ def _knowledge_settings_signature(settings) -> tuple[object, ...]:
 
 
 def _get_services(request: Request) -> tuple[TagService, KnowledgeIndexService, RagService]:
+    from video_sum_service.knowledge.index_service import KnowledgeIndexService
+    from video_sum_service.knowledge.rag_service import RagService
+    from video_sum_service.knowledge.tag_service import TagService
+
     task_store: SqliteTaskRepository = request.app.state.task_repository
     settings = settings_manager.current
     settings_signature = _knowledge_settings_signature(settings)
@@ -105,7 +114,7 @@ def _require_knowledge_runtime() -> None:
     if not _knowledge_runtime_ready():
         raise HTTPException(
             status_code=424,
-            detail="知识库依赖未安装。请先到设置中的知识库或运行时板块安装知识库依赖。",
+            detail="知识库依赖未安装。请先到设置中的知识库或运行环境板块安装知识库依赖。",
         )
 
 
@@ -253,6 +262,8 @@ async def ask_knowledge_stream(body: KnowledgeAskRequest, request: Request) -> S
 
 @router.get("/stats", response_model=KnowledgeStatsResponse)
 def get_knowledge_stats(request: Request) -> KnowledgeStatsResponse:
+    from video_sum_service.knowledge.local_llm import knowledge_llm_available
+
     tag_service, index_service, _rag_service = _get_services(request)
     task_store: SqliteTaskRepository = request.app.state.task_repository
     settings = settings_manager.current

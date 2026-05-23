@@ -2,20 +2,42 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel
-
 from video_sum_infra.config import (
+    DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT,
+    DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE,
     DEFAULT_SUMMARY_SYSTEM_PROMPT,
     DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE,
+    DEFAULT_VISUAL_FRAME_PLANNING_PROMPT,
+    DEFAULT_VISUAL_NOTE_SYSTEM_PROMPT,
+    DEFAULT_VISUAL_NOTE_USER_PROMPT_TEMPLATE,
+    DEFAULT_VISUAL_VLM_PROMPT,
     LEGACY_SUMMARY_SYSTEM_PROMPT,
     LEGACY_SUMMARY_USER_PROMPT_TEMPLATE,
     PREVIOUS_DEFAULT_SUMMARY_SYSTEM_PROMPT,
     PREVIOUS_DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE,
+    PREVIOUS_DEFAULT_VISUAL_FRAME_PLANNING_PROMPT,
+    PREVIOUS_DEFAULT_VISUAL_VLM_PROMPT,
     ServiceSettings,
     recommend_mindmap_concurrency,
     recommend_task_concurrency,
 )
+
+SECRET_SETTINGS_FIELDS = {
+    "siliconflow_asr_api_key",
+    "multimodal_asr_api_key",
+    "llm_api_key",
+    "knowledge_llm_api_key",
+    "visual_evidence_api_key",
+}
+MASKED_SECRET_PLACEHOLDER = "******"
+
+
+def is_blank_or_masked_secret(value: object) -> bool:
+    text = str(value or "").strip()
+    return not text or text == MASKED_SECRET_PLACEHOLDER
 
 
 class SettingsUpdatePayload(BaseModel):
@@ -36,6 +58,13 @@ class SettingsUpdatePayload(BaseModel):
     siliconflow_asr_base_url: str | None = None
     siliconflow_asr_model: str | None = None
     siliconflow_asr_api_key: str | None = None
+    siliconflow_asr_chunk_duration_seconds: int | None = None
+    siliconflow_asr_concurrency: int | None = None
+    multimodal_asr_base_url: str | None = None
+    multimodal_asr_model: str | None = None
+    multimodal_asr_api_key: str | None = None
+    multimodal_asr_chunk_duration_seconds: int | None = None
+    multimodal_asr_max_retries: int | None = None
     cuda_variant: str | None = None
     runtime_channel: str | None = None
     output_dir: str | None = None
@@ -43,14 +72,33 @@ class SettingsUpdatePayload(BaseModel):
     enable_cache: bool | None = None
     language: str | None = None
     summary_mode: str | None = None
+    prompt_router_mode: str | None = None
+    prompt_presets_path: str | None = None
     llm_enabled: bool | None = None
     auto_generate_mindmap: bool | None = None
+    visual_note_mode: str | None = None
+    visual_evidence_enabled: bool | None = None
+    visual_multimodal_enabled: bool | None = None
+    visual_download_resolution: str | None = None
+    visual_evidence_use_llm: bool | None = None
+    visual_vlm_provider: str | None = None
+    visual_evidence_base_url: str | None = None
+    visual_evidence_model: str | None = None
+    visual_evidence_api_key: str | None = None
+    visual_evidence_max_frames: int | None = None
+    visual_evidence_frame_interval_seconds: int | None = None
+    visual_evidence_frame_width: int | None = None
+    visual_evidence_image_quality: int | None = None
+    visual_evidence_timeout_seconds: int | None = None
+    visual_evidence_retry_count: int | None = None
     llm_provider: str | None = None
     llm_base_url: str | None = None
     llm_model: str | None = None
     llm_api_key: str | None = None
+    llm_test_scope: Literal["main", "knowledge", "visual"] | None = None
     knowledge_llm_mode: str | None = None
     knowledge_llm_enabled: bool | None = None
+    knowledge_llm_provider: str | None = None
     knowledge_llm_base_url: str | None = None
     knowledge_llm_model: str | None = None
     knowledge_llm_api_key: str | None = None
@@ -58,6 +106,12 @@ class SettingsUpdatePayload(BaseModel):
     knowledge_enabled: bool | None = None
     summary_system_prompt: str | None = None
     summary_user_prompt_template: str | None = None
+    knowledge_note_system_prompt: str | None = None
+    knowledge_note_user_prompt_template: str | None = None
+    visual_note_system_prompt: str | None = None
+    visual_note_user_prompt_template: str | None = None
+    visual_frame_planning_prompt: str | None = None
+    visual_vlm_prompt: str | None = None
     summary_chunk_target_chars: int | None = None
     summary_chunk_overlap_segments: int | None = None
     task_concurrency: int | None = None
@@ -93,6 +147,22 @@ class SettingsManager:
                 stored["summary_user_prompt_template"] = DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE
             if stored.get("summary_user_prompt_template") == PREVIOUS_DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE:
                 stored["summary_user_prompt_template"] = DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE
+            if "knowledge_note_system_prompt" not in stored:
+                stored["knowledge_note_system_prompt"] = DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT
+            if "knowledge_note_user_prompt_template" not in stored:
+                stored["knowledge_note_user_prompt_template"] = DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE
+            if "visual_note_system_prompt" not in stored:
+                stored["visual_note_system_prompt"] = DEFAULT_VISUAL_NOTE_SYSTEM_PROMPT
+            if "visual_note_user_prompt_template" not in stored:
+                stored["visual_note_user_prompt_template"] = DEFAULT_VISUAL_NOTE_USER_PROMPT_TEMPLATE
+            if "visual_frame_planning_prompt" not in stored:
+                stored["visual_frame_planning_prompt"] = DEFAULT_VISUAL_FRAME_PLANNING_PROMPT
+            if stored.get("visual_frame_planning_prompt") == PREVIOUS_DEFAULT_VISUAL_FRAME_PLANNING_PROMPT:
+                stored["visual_frame_planning_prompt"] = DEFAULT_VISUAL_FRAME_PLANNING_PROMPT
+            if "visual_vlm_prompt" not in stored:
+                stored["visual_vlm_prompt"] = DEFAULT_VISUAL_VLM_PROMPT
+            if stored.get("visual_vlm_prompt") == PREVIOUS_DEFAULT_VISUAL_VLM_PROMPT:
+                stored["visual_vlm_prompt"] = DEFAULT_VISUAL_VLM_PROMPT
             migrated = False
             candidate = ServiceSettings.model_validate({**self._base_settings.model_dump(), **stored})
             if "task_concurrency" not in stored:
@@ -119,7 +189,10 @@ class SettingsManager:
 
     def save(self, payload: SettingsUpdatePayload) -> ServiceSettings:
         current_dump = self._settings.model_dump(mode="json")
-        updates = payload.model_dump(exclude_none=True)
+        updates = payload.model_dump(exclude_none=True, exclude={"llm_test_scope"})
+        for field in SECRET_SETTINGS_FIELDS:
+            if field in updates and is_blank_or_masked_secret(updates[field]) and current_dump.get(field):
+                updates.pop(field)
         next_settings = ServiceSettings.model_validate({**current_dump, **updates})
         self._settings_path.parent.mkdir(parents=True, exist_ok=True)
         self._settings_path.write_text(

@@ -1,6 +1,6 @@
 {
   "name": "bilisum",
-  "version": "1.13.3",
+  "version": "1.16.3",
   "description": "Start the local BiliSum service from npx.",
   "bin": {
     "bilisum": "bin/bilisum.js"
@@ -36,8 +36,5 @@
   "license": "MIT",
   "publishConfig": {
     "access": "public"
-  },
-  "dependencies": {
-    "bilisum": "^1.13.3"
   }
 }

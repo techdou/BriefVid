@@ -32,6 +32,8 @@ def build_task_markdown_export(
     tags: list[str],
     target: str = "obsidian",
     mindmap_path: str | None = None,
+    transcript_text: str = "",
+    include_transcript: bool = False,
 ) -> str:
     normalized_title = str(title or "").strip() or "BiliSum 知识笔记"
     body = _build_markdown_body(
@@ -41,6 +43,8 @@ def build_task_markdown_export(
         key_points=key_points,
         timeline=timeline,
         mindmap_path=mindmap_path,
+        transcript_text=transcript_text,
+        include_transcript=include_transcript,
     )
     if str(target or "obsidian").strip().lower() != "obsidian":
         return body
@@ -82,6 +86,8 @@ def _build_markdown_body(
     key_points: list[str],
     timeline: list[dict[str, object]],
     mindmap_path: str | None,
+    transcript_text: str,
+    include_transcript: bool,
 ) -> str:
     sections = [
         f"# {title}",
@@ -99,6 +105,13 @@ def _build_markdown_body(
             [
                 "## 思维导图引用信息",
                 f"- 导图文件：`{Path(str(mindmap_path)).as_posix()}`",
+            ]
+        )
+    if include_transcript and str(transcript_text or "").strip():
+        sections.extend(
+            [
+                "## 转写全文",
+                f"```text\n{str(transcript_text).strip()}\n```",
             ]
         )
     return "\n\n".join(section.strip() for section in sections if str(section).strip())

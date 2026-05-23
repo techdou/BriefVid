@@ -94,3 +94,34 @@ def test_cleanup_task_files_removes_single_task_directory(tmp_path: Path) -> Non
     cleanup_task_files(task, settings)
 
     assert not task_dir.exists()
+
+
+def test_cleanup_task_files_preserves_external_export_directory(tmp_path: Path) -> None:
+    tasks_dir = tmp_path / "tasks"
+    task_id = "d" * 32
+    task_dir = tasks_dir / task_id
+    external_dir = tmp_path / "obsidian-vault"
+    task_dir.mkdir(parents=True)
+    external_dir.mkdir(parents=True)
+    summary_path = task_dir / "summary.json"
+    export_path = external_dir / "笔记.md"
+    summary_path.write_text("{}", encoding="utf-8")
+    export_path.write_text("# note", encoding="utf-8")
+
+    settings = ServiceSettings(tasks_dir=tasks_dir, cache_dir=tmp_path / "cache")
+    task = TaskRecord(
+        task_id=task_id,
+        task_input=TaskInput(input_type=InputType.URL, source="https://www.bilibili.com/video/BV-task-cleanup", title="测试视频"),
+        result=TaskResult(
+            artifacts={
+                "summary_path": str(summary_path),
+                "obsidian_note_path": str(export_path),
+            }
+        ),
+    )
+
+    cleanup_task_files(task, settings)
+
+    assert not task_dir.exists()
+    assert external_dir.exists()
+    assert export_path.exists()

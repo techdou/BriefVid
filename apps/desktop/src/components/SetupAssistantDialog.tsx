@@ -2,6 +2,7 @@ import type { ConfigHealth } from "../appModel";
 
 type SetupAssistantDialogProps = {
   isOpen: boolean;
+  force?: boolean;
   configHealth: ConfigHealth;
   onClose(): void;
   onOpenSettings(): void;
@@ -10,12 +11,13 @@ type SetupAssistantDialogProps = {
 
 export function SetupAssistantDialog({
   isOpen,
+  force,
   configHealth,
   onClose,
   onOpenSettings,
   onNavigateToIssue,
 }: SetupAssistantDialogProps) {
-  if (!isOpen || !configHealth.checked || configHealth.issues.length === 0) {
+  if (!isOpen || !configHealth.checked || (!force && configHealth.issues.length === 0)) {
     return null;
   }
 
@@ -34,7 +36,13 @@ export function SetupAssistantDialog({
         <div className="update-dialog-body setup-assistant-body">
           <div className={`setup-assistant-hero tone-${configHealth.state}`}>
             <span className="section-kicker">Setup Assistant</span>
-            <strong>{configHealth.hasBlockingIssues ? "先补全关键配置，才能顺利开始总结" : "当前建议先补全增强能力配置"}</strong>
+            <strong>
+              {configHealth.issues.length === 0
+                ? "当前运行配置完整，可以直接开始总结"
+                : configHealth.hasBlockingIssues
+                  ? "先补全关键配置，才能顺利开始总结"
+                  : "当前建议先补全增强能力配置"}
+            </strong>
             <p>{configHealth.summary}</p>
           </div>
 
@@ -43,7 +51,7 @@ export function SetupAssistantDialog({
               <span>1</span>
               <div>
                 <strong>先补基础转写能力</strong>
-                <p>优先保证“云端转写 API Key”或“本地 ASR 运行时”可用，这是开始处理视频的前提。</p>
+                <p>优先保证"云端转写 API Key"或"本地 ASR 运行环境"可用，这是开始处理视频的前提。</p>
               </div>
             </div>
             <div className="setup-assistant-step">
@@ -62,19 +70,26 @@ export function SetupAssistantDialog({
             </div>
           </div>
 
-          <div className="setup-assistant-issues">
-            {configHealth.issues.map((issue) => (
-              <button
-                className={`setup-assistant-issue tone-${issue.severity === "critical" ? "critical" : "warning"}`}
-                type="button"
-                key={issue.key}
-                onClick={() => onNavigateToIssue(issue.key)}
-              >
-                <strong>{issue.title}</strong>
-                <p>{issue.description}</p>
-              </button>
-            ))}
-          </div>
+          {configHealth.issues.length > 0 ? (
+            <div className="setup-assistant-issues">
+              {configHealth.issues.map((issue) => (
+                <button
+                  className={`setup-assistant-issue tone-${issue.severity === "critical" ? "critical" : "warning"}`}
+                  type="button"
+                  key={issue.key}
+                  onClick={() => onNavigateToIssue(issue.key)}
+                >
+                  <strong>{issue.title}</strong>
+                  <p>{issue.description}</p>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="setup-assistant-ok">
+              <span className="setup-assistant-ok-icon">OK</span>
+              <p>所有必需配置已补全，可以直接使用。如需调整，请前往设置页面。</p>
+            </div>
+          )}
         </div>
 
         <div className="update-dialog-footer">

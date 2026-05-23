@@ -15,6 +15,8 @@ export type ChapterGroupItem = {
 };
 
 export type TaskMindMapStatus = "idle" | "generating" | "ready" | "failed";
+export type TaskVisualEvidenceStatus = "idle" | "generating" | "ready" | "partial" | "failed" | "unsupported";
+export type VisualNoteMode = "text" | "frame_insert" | "vlm_integrated";
 
 export type MindMapNode = {
   id: string;
@@ -50,6 +52,13 @@ export type TaskResult = {
   mindmap_error_message?: string | null;
   mindmap_artifact_path?: string | null;
   mindmap_updated_at?: string | null;
+  visual_note_status?: TaskVisualEvidenceStatus;
+  visual_note_error_message?: string | null;
+  visual_note_artifact_path?: string | null;
+  visual_enhanced_note_artifact_path?: string | null;
+  visual_note_updated_at?: string | null;
+  visual_note_mode?: VisualNoteMode | string;
+  visual_frame_count?: number;
 };
 
 export type VideoAssetSummary = {
@@ -98,6 +107,33 @@ export type VideoProbeResult = {
   pages: VideoPageOption[];
 };
 
+export type PromptPreset = {
+  id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  icon?: string | null;
+  system_prompt: string;
+  user_prompt_template: string;
+  auto_match_keywords: string[];
+  is_builtin: boolean;
+};
+
+export type PromptPresetCreateRequest = {
+  name: string;
+  system_prompt: string;
+  user_prompt_template: string;
+  description?: string | null;
+  category?: string | null;
+  auto_match_keywords?: string[];
+};
+
+export type PromptMatchResult = {
+  preset: PromptPreset;
+  match_type: "keyword" | "fallback" | string;
+  confidence: number;
+};
+
 export type TaskSummary = {
   task_id: string;
   video_id?: string | null;
@@ -136,6 +172,7 @@ export type VideoTaskBatchPageResult = {
 export type VideoTaskBatchRequest = {
   page_numbers: number[];
   confirm?: boolean;
+  prompt_preset_id?: string | null;
 };
 
 export type VideoTaskBatchResponse = {
@@ -155,11 +192,55 @@ export type TaskMindMapResponse = {
   mindmap?: TaskMindMap | null;
 };
 
+export type VisualEvidenceFrame = {
+  frame_id: string;
+  timestamp_seconds: number;
+  timestamp?: string;
+  file_name: string;
+  image_path?: string;
+};
+
+export type VisualEvidenceObservation = {
+  frame_id: string;
+  timestamp_seconds: number;
+  caption: string;
+  ocr_text?: string;
+  scene?: string;
+  confidence?: number | null;
+};
+
+export type VisualEvidenceContext = {
+  schema_version?: number;
+  task_id?: string;
+  status?: TaskVisualEvidenceStatus | string;
+  source_kind?: string;
+  provider?: string;
+  model?: string;
+  frame_count?: number;
+  frames?: VisualEvidenceFrame[];
+  observations?: VisualEvidenceObservation[];
+  warnings?: string[];
+};
+
+export type TaskVisualEvidenceResponse = {
+  task_id: string;
+  mode: VisualNoteMode | string;
+  status: TaskVisualEvidenceStatus;
+  error_message?: string | null;
+  updated_at?: string | null;
+  frame_count: number;
+  insert_count: number;
+  visual_note_markdown: string;
+  enhanced_note_markdown: string;
+  context?: VisualEvidenceContext | null;
+};
+
 export type TaskMarkdownExportTarget = "markdown" | "obsidian";
+export type TaskExportTarget = TaskMarkdownExportTarget | "transcript";
 
 export type TaskMarkdownExportResponse = {
   task_id: string;
-  target_format: TaskMarkdownExportTarget;
+  target_format: TaskExportTarget;
   path: string;
   directory: string;
   file_name: string;
@@ -224,6 +305,13 @@ export type RuntimeStatus = {
   channels: RuntimeChannelStatus[];
 };
 
+export type AuthStatus = {
+  required: boolean;
+  authenticated: boolean;
+  configuredFromEnv?: boolean;
+  tokenFile?: string;
+};
+
 export type ServiceSettings = {
   host: string;
   port: number;
@@ -243,6 +331,14 @@ export type ServiceSettings = {
   siliconflow_asr_model: string;
   siliconflow_asr_api_key: string;
   siliconflow_asr_api_key_configured?: boolean;
+  siliconflow_asr_chunk_duration_seconds: number;
+  siliconflow_asr_concurrency: number;
+  multimodal_asr_base_url: string;
+  multimodal_asr_model: string;
+  multimodal_asr_api_key: string;
+  multimodal_asr_api_key_configured?: boolean;
+  multimodal_asr_chunk_duration_seconds: number;
+  multimodal_asr_max_retries: number;
   cuda_variant: string;
   runtime_channel: string;
   output_dir: string;
@@ -250,8 +346,26 @@ export type ServiceSettings = {
   enable_cache: boolean;
   language: string;
   summary_mode: string;
+  prompt_router_mode: "auto" | "confirm" | string;
+  prompt_presets_path: string;
   llm_enabled: boolean;
   auto_generate_mindmap: boolean;
+  visual_note_mode: VisualNoteMode;
+  visual_evidence_enabled: boolean;
+  visual_multimodal_enabled: boolean;
+  visual_download_resolution: string;
+  visual_evidence_use_llm: boolean;
+  visual_vlm_provider: string;
+  visual_evidence_base_url: string;
+  visual_evidence_model: string;
+  visual_evidence_api_key: string;
+  visual_evidence_api_key_configured?: boolean;
+  visual_evidence_max_frames: number;
+  visual_evidence_frame_interval_seconds: number;
+  visual_evidence_frame_width: number;
+  visual_evidence_image_quality: number;
+  visual_evidence_timeout_seconds: number;
+  visual_evidence_retry_count: number;
   llm_provider: string;
   llm_api_key: string;
   llm_base_url: string;
@@ -259,6 +373,7 @@ export type ServiceSettings = {
   llm_api_key_configured?: boolean;
   knowledge_llm_mode: string;
   knowledge_llm_enabled: boolean;
+  knowledge_llm_provider: string;
   knowledge_llm_api_key: string;
   knowledge_llm_base_url: string;
   knowledge_llm_model: string;
@@ -267,6 +382,12 @@ export type ServiceSettings = {
   knowledge_index_auto_rebuild: string;
   summary_system_prompt: string;
   summary_user_prompt_template: string;
+  knowledge_note_system_prompt: string;
+  knowledge_note_user_prompt_template: string;
+  visual_note_system_prompt: string;
+  visual_note_user_prompt_template: string;
+  visual_frame_planning_prompt: string;
+  visual_vlm_prompt: string;
   summary_chunk_target_chars: number;
   summary_chunk_overlap_segments: number;
   task_concurrency: number;
@@ -276,6 +397,16 @@ export type ServiceSettings = {
   ytdlp_cookies_file: string;
   ytdlp_cookies_browser: string;
   settings_file_exists?: boolean;
+  defaults?: {
+    knowledge_note_system_prompt?: string;
+    knowledge_note_user_prompt_template?: string;
+    visual_note_system_prompt?: string;
+    visual_note_user_prompt_template?: string;
+    visual_frame_planning_prompt?: string;
+    visual_vlm_prompt?: string;
+    summary_system_prompt?: string;
+    summary_user_prompt_template?: string;
+  };
 };
 
 export type SystemInfo = {
@@ -290,6 +421,16 @@ export type SystemInfo = {
     log_file?: string;
   };
   settings?: ServiceSettings;
+  environment?: EnvironmentInfo;
+  runtimeStartup?: RuntimeStartupInfo;
+};
+
+export type RuntimeStartupInfo = {
+  status?: "initializing" | "ready" | "error" | string;
+  message?: string | null;
+  started_at?: string | null;
+  ready_at?: string | null;
+  error_at?: string | null;
   environment?: EnvironmentInfo;
 };
 

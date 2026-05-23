@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import math
@@ -10,12 +12,35 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, NoReturn
 
 import httpx
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from video_sum_infra.config import (
+    DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT,
+    DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE,
+    DEFAULT_SUMMARY_SYSTEM_PROMPT,
+    DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE,
+    normalize_visual_note_mode,
+)
+from video_sum_infra.llm import (
+    ANTHROPIC_API_VERSION,
+    anthropic_messages_url,
+    build_anthropic_messages_payload,
+    extract_llm_message_content,
+    is_anthropic_llm,
+    normalize_openai_compatible_model_name,
+    openai_chat_completions_url,
+)
+from video_sum_infra.prompt_library import load_presets
+from video_sum_infra.runtime import (
+    ffmpeg_location,
+    runtime_library_dirs,
+    runtime_python_executable,
+    runtime_pythonpath_dirs,
+    sanitized_subprocess_dll_search,
+)
 
 from video_sum_core.errors import (
     LLMAuthenticationError,
@@ -25,17 +50,18 @@ from video_sum_core.errors import (
     UnsupportedInputError,
     VideoSumError,
 )
-from video_sum_core.models.tasks import InputType, MindMapNode, TaskMindMap, TaskResult
-from video_sum_core.pipeline.base import PipelineContext, PipelineEvent, PipelineEventReporter, PipelineRunner
-from video_sum_core.utils import ensure_directory, normalize_video_url, sanitize_filename
-from video_sum_infra.runtime import (
-    ffmpeg_location,
-    runtime_library_dirs,
-    runtime_python_executable,
-    sanitized_subprocess_dll_search,
+from video_sum_core.models.tasks import InputType, MindMapNode, TaskInput, TaskMindMap, TaskResult
+from video_sum_core.pipeline.base import (
+    PipelineContext,
+    PipelineEvent,
+    PipelineEventReporter,
+    PipelineRunner,
 )
+from video_sum_core.utils import ensure_directory, normalize_video_url, sanitize_filename
 
 logger = logging.getLogger("video_sum_core.pipeline.real")
+YoutubeDL = None
+DownloadError = None
 
 _BILIBILI_HTTP_HEADERS = {
     "User-Agent": (
@@ -46,6 +72,20 @@ _BILIBILI_HTTP_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://www.bilibili.com/",
 }
+
+
+def _get_ytdlp_classes():
+    global DownloadError, YoutubeDL
+    if YoutubeDL is None:
+        from yt_dlp import YoutubeDL as ImportedYoutubeDL
+
+        YoutubeDL = ImportedYoutubeDL
+    if DownloadError is None:
+        from yt_dlp.utils import DownloadError as ImportedDownloadError
+
+        DownloadError = ImportedDownloadError
+    return YoutubeDL, DownloadError
+
 
 def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
     if os.name != "nt":
@@ -143,6 +183,7 @@ def _should_retry_llm_transport_error(error: Exception) -> bool:
 @dataclass(slots=True)
 class PipelineSettings:
     tasks_dir: Path
+    data_dir: Path | str | None = None
     runtime_channel: str = "base"
     transcription_provider: str = "siliconflow"
     whisper_model: str = "tiny"
@@ -152,12 +193,43 @@ class PipelineSettings:
     siliconflow_asr_base_url: str = "https://api.siliconflow.cn/v1"
     siliconflow_asr_model: str = "TeleAI/TeleSpeechASR"
     siliconflow_asr_api_key: str = ""
+    siliconflow_asr_chunk_duration_seconds: int = 1800
+    siliconflow_asr_concurrency: int = 2
+    multimodal_asr_base_url: str = ""
+    multimodal_asr_model: str = "mimo-v2-omni"
+    multimodal_asr_api_key: str = ""
+    multimodal_asr_chunk_duration_seconds: int = 180
+    multimodal_asr_max_retries: int = 5
     llm_enabled: bool = False
+    llm_provider: str = "openai-compatible"
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = ""
+    visual_evidence_enabled: bool = False
+    visual_note_mode: str = "text"
+    visual_multimodal_enabled: bool = False
+    visual_download_resolution: str = "720p"
+    visual_evidence_use_llm: bool = True
+    visual_vlm_provider: str = "openai-compatible"
+    visual_evidence_base_url: str = ""
+    visual_evidence_model: str = ""
+    visual_evidence_api_key: str = ""
+    visual_evidence_max_frames: int = 12
+    visual_evidence_frame_interval_seconds: int = 10
+    visual_evidence_frame_width: int = 960
+    visual_evidence_vlm_image_width: int = 768
+    visual_evidence_image_quality: int = 85
+    visual_evidence_timeout_seconds: int = 120
+    visual_evidence_retry_count: int = 1
+    visual_note_system_prompt: str = ""
+    visual_note_user_prompt_template: str = ""
+    visual_frame_planning_prompt: str = ""
+    visual_vlm_prompt: str = ""
     summary_system_prompt: str = ""
     summary_user_prompt_template: str = ""
+    prompt_presets_path: str = ""
+    knowledge_note_system_prompt: str = ""
+    knowledge_note_user_prompt_template: str = ""
     mindmap_system_prompt: str = ""
     mindmap_user_prompt_template: str = ""
     summary_chunk_target_chars: int = 2200
@@ -277,9 +349,25 @@ class RealPipelineRunner(PipelineRunner):
                 "result_scope": "transcript",
             },
         )
-        summary = self._summarize(transcript, segments, title, emit)
+        summary = self._summarize(
+            transcript,
+            segments,
+            title,
+            emit,
+            prompt_preset_id=task_input.options.prompt_preset_id,
+        )
         emit("exporting", 97, "正在导出任务结果")
         result = self._export_result(task_dir, title, transcript, segments, summary)
+        emit(
+            "exporting",
+            98,
+            "纯文本知识笔记已写入，正在生成图文笔记",
+            {
+                "result": result.model_dump(mode="json"),
+                "result_scope": "knowledge_note",
+            },
+        )
+        result = self._build_inline_visual_note(context.task_id, task_input, task_dir, title, result, emit)
         emit("exporting", 99, "结果文件已写入本地目录")
         logger.info(
             "pipeline url run finish task_id=%s segments=%d transcript_chars=%d output_dir=%s",
@@ -313,9 +401,26 @@ class RealPipelineRunner(PipelineRunner):
             "已跳过重新转写，直接复用分 P 摘要素材" if is_aggregate_series else "已跳过重新转写，直接复用当前版本文本",
             {"transcript_chars": len(transcript), "segment_count": len(segments)},
         )
-        summary = self._summarize(transcript, segments, title, emit, source_kind=source_kind)
+        summary = self._summarize(
+            transcript,
+            segments,
+            title,
+            emit,
+            source_kind=source_kind,
+            prompt_preset_id=context.task_input.options.prompt_preset_id,
+        )
         emit("exporting", 97, "正在导出新的摘要结果")
         result = self._export_result(task_dir, title, transcript, segments, summary)
+        emit(
+            "exporting",
+            98,
+            "纯文本知识笔记已写入，正在生成图文笔记",
+            {
+                "result": result.model_dump(mode="json"),
+                "result_scope": "knowledge_note",
+            },
+        )
+        result = self._build_inline_visual_note(context.task_id, context.task_input, task_dir, title, result, emit)
         emit("exporting", 99, "新的摘要结果已写入本地目录")
         logger.info(
             "pipeline transcript rerun finish task_id=%s segments=%d transcript_chars=%d output_dir=%s",
@@ -364,9 +469,25 @@ class RealPipelineRunner(PipelineRunner):
                 "result_scope": "transcript",
             },
         )
-        summary = self._summarize(transcript, segments, title, emit)
+        summary = self._summarize(
+            transcript,
+            segments,
+            title,
+            emit,
+            prompt_preset_id=task_input.options.prompt_preset_id,
+        )
         emit("exporting", 97, "正在导出任务结果")
         result = self._export_result(task_dir, title, transcript, segments, summary)
+        emit(
+            "exporting",
+            98,
+            "纯文本知识笔记已写入，正在生成图文笔记",
+            {
+                "result": result.model_dump(mode="json"),
+                "result_scope": "knowledge_note",
+            },
+        )
+        result = self._build_inline_visual_note(context.task_id, task_input, task_dir, title, result, emit)
         emit("exporting", 99, "结果文件已写入本地目录")
         logger.info(
             "pipeline local media run finish task_id=%s input_type=%s source=%s segments=%d transcript_chars=%d output_dir=%s",
@@ -516,7 +637,7 @@ class RealPipelineRunner(PipelineRunner):
                 logger.warning("yt-dlp cookie file does not exist: %s", cookie_path)
         return options
 
-    def _raise_ydl_error(self, error: DownloadError) -> NoReturn:
+    def _raise_ydl_error(self, error: Exception) -> NoReturn:
         message = str(error)
         if "Could not copy Chrome cookie database" in message:
             raise VideoSumError(
@@ -537,6 +658,7 @@ class RealPipelineRunner(PipelineRunner):
         raise VideoSumError(f"Failed to read or download video with yt-dlp: {message}") from error
 
     def _probe_video(self, url: str) -> dict:
+        YoutubeDL, DownloadError = _get_ytdlp_classes()
         try:
             with YoutubeDL(self._base_ydl_options()) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -668,6 +790,7 @@ class RealPipelineRunner(PipelineRunner):
             logger.info("using ffmpeg location: %s", ffmpeg_exe)
         else:
             logger.warning("ffmpeg not found, yt_dlp will use system PATH")
+        YoutubeDL, DownloadError = _get_ytdlp_classes()
         try:
             with YoutubeDL(options) as ydl:
                 ydl.download([url])
@@ -716,8 +839,11 @@ class RealPipelineRunner(PipelineRunner):
         duration: float | None,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
     ) -> tuple[str, list[dict[str, object]]]:
-        if self._settings.transcription_provider == "siliconflow":
+        provider = self._settings.transcription_provider
+        if provider == "siliconflow":
             return self._transcribe_with_siliconflow(audio_path, duration, emit)
+        if provider == "multimodal":
+            return self._transcribe_with_multimodal(audio_path, duration, emit)
         return self._transcribe_with_local_whisper(audio_path, duration, emit)
 
     def _transcribe_with_local_whisper(
@@ -802,6 +928,9 @@ class RealPipelineRunner(PipelineRunner):
         duration: float | None,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
     ) -> tuple[str, list[dict[str, object]]]:
+        import subprocess
+        import tempfile
+
         base_url = (self._settings.siliconflow_asr_base_url or "").rstrip("/")
         model_name = (self._settings.siliconflow_asr_model or "").strip()
         api_key = (self._settings.siliconflow_asr_api_key or "").strip()
@@ -817,50 +946,393 @@ class RealPipelineRunner(PipelineRunner):
             f"正在连接语音识别服务 {model_name}",
             {"provider": "siliconflow", "model": model_name},
         )
-        emit(
-            "transcribing",
-            58,
-            "正在上传音频到硅基流动语音识别服务",
-            {"provider": "siliconflow", "audio_name": audio_path.name},
-        )
 
+        chunk_duration = max(60, int(self._settings.siliconflow_asr_chunk_duration_seconds or 1800))
+        concurrency = max(1, min(int(self._settings.siliconflow_asr_concurrency or 2), 8))
+        total_duration = float(duration or 0)
+
+        # Determine total duration via ffprobe if unknown
+        if total_duration <= 0:
+            try:
+                result = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                total_duration = float(result.stdout.strip())
+            except Exception:
+                total_duration = 0
+
+        file_size = audio_path.stat().st_size
+        needs_chunking = total_duration > (chunk_duration * 1.1) or file_size > 500 * 1024 * 1024
+
+        if not needs_chunking:
+            emit("transcribing", 58, "正在上传音频到语音识别服务", {"provider": "siliconflow"})
+            transcript = self._siliconflow_transcribe_chunk(
+                audio_path, audio_path.name, model_name, api_key, request_url, 0, 1, emit,
+            )
+            if not transcript:
+                raise VideoSumError("SiliconFlow ASR returned empty transcript text.")
+            emit("transcribing", 78, "语音识别完成，正在整理文本", {"provider": "siliconflow"})
+            segments = self._build_fallback_segments_from_transcript(transcript, duration)
+            emit("transcribing", 84, f"转写完成，共 {len(segments)} 段", {"provider": "siliconflow"})
+            return self._render_transcript_from_segments(segments), segments
+
+        num_chunks = max(1, int(-(-total_duration // chunk_duration)))
+        emit("transcribing", 55, f"音频 {int(total_duration)}s，分 {num_chunks} 段并发识别", {"provider": "siliconflow", "chunks": num_chunks, "concurrency": concurrency})
+
+        chunk_jobs: list[tuple[int, float, Path]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(num_chunks):
+                chunk_start = i * chunk_duration
+                chunk_path = Path(tmpdir) / f"sf_chunk_{i:03d}.mp3"
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y", "-i", str(audio_path),
+                    "-ss", str(chunk_start), "-t", str(chunk_duration),
+                    "-acodec", "libmp3lame", "-ab", "64k", "-ar", "16000", "-ac", "1",
+                    str(chunk_path),
+                ]
+                subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=120)
+                if chunk_path.exists() and chunk_path.stat().st_size > 0:
+                    chunk_jobs.append((i, chunk_start, chunk_path))
+                else:
+                    logger.warning("siliconflow asr chunk %d/%d extraction failed", i + 1, num_chunks)
+
+            results: dict[int, str] = {}
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = {
+                    pool.submit(
+                        self._siliconflow_transcribe_chunk,
+                        job[2], f"chunk_{job[0]:03d}.mp3", model_name, api_key, request_url,
+                        job[1], num_chunks, emit,
+                    ): job[0]
+                    for job in chunk_jobs
+                }
+                for future in as_completed(futures):
+                    chunk_idx = futures[future]
+                    try:
+                        results[chunk_idx] = future.result() or ""
+                    except Exception as exc:
+                        logger.warning("siliconflow asr chunk %d failed: %s", chunk_idx, exc)
+
+        if not results:
+            raise VideoSumError("SiliconFlow ASR returned empty transcript for all chunks.")
+
+        all_transcripts = [(k * chunk_duration, results[k]) for k in sorted(results) if results[k]]
+        full_transcript = "\n".join(text for _, text in all_transcripts)
+        emit("transcribing", 78, f"并发识别完成，{len(results)}/{len(chunk_jobs)} 段成功", {"provider": "siliconflow"})
+
+        segments: list[dict[str, object]] = []
+        for chunk_offset, chunk_text in all_transcripts:
+            actual_dur = min(chunk_duration, max(1.0, total_duration - chunk_offset))
+            chunk_segs = self._build_fallback_segments_from_transcript(chunk_text, actual_dur)
+            for seg in chunk_segs:
+                segments.append({
+                    "start": round(seg["start"] + chunk_offset, 3),
+                    "end": round(seg["end"] + chunk_offset, 3),
+                    "text": seg["text"],
+                })
+        emit("transcribing", 84, f"转写完成，共 {len(segments)} 段", {"provider": "siliconflow"})
+        return self._render_transcript_from_segments(segments), segments
+
+    def _siliconflow_transcribe_chunk(
+        self,
+        chunk_path: Path,
+        file_name: str,
+        model_name: str,
+        api_key: str,
+        request_url: str,
+        chunk_offset: float,
+        total_chunks: int,
+        emit: Callable[[str, int, str, dict[str, object] | None], None],
+    ) -> str:
         headers = {"Authorization": f"Bearer {api_key}"}
         timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
-        try:
-            with audio_path.open("rb") as audio_handle, httpx.Client(timeout=timeout) as client:
-                response = client.post(
-                    request_url,
-                    headers=headers,
-                    data={"model": model_name},
-                    files={"file": (audio_path.name, audio_handle, "audio/mpeg")},
+        max_retries = 3
+        for attempt in range(max_retries):
+            if attempt > 0:
+                time.sleep(3 * (attempt + 1))
+            try:
+                with chunk_path.open("rb") as f, httpx.Client(timeout=timeout) as client:
+                    response = client.post(
+                        request_url,
+                        headers=headers,
+                        data={"model": model_name},
+                        files={"file": (file_name, f, "audio/mpeg")},
+                    )
+                if response.status_code in {401, 403}:
+                    detail = _extract_response_error_detail(response)
+                    raise TranscriptionAuthenticationError(f"SiliconFlow ASR auth failed: {detail}")
+                if response.status_code >= 400:
+                    detail = _extract_response_error_detail(response)
+                    logger.warning("siliconflow asr chunk error (offset=%.0fs): %s", chunk_offset, detail)
+                    continue
+                payload = response.json()
+                text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+                if text:
+                    return text
+                logger.warning("siliconflow asr chunk empty (offset=%.0fs, attempt=%d)", chunk_offset, attempt + 1)
+            except httpx.HTTPError as exc:
+                logger.warning("siliconflow asr chunk request failed (offset=%.0fs): %s", chunk_offset, exc)
+        return ""
+
+    def _transcribe_with_multimodal(
+        self,
+        audio_path: Path,
+        duration: float | None,
+        emit: Callable[[str, int, str, dict[str, object] | None], None],
+    ) -> tuple[str, list[dict[str, object]]]:
+        import base64
+        import subprocess
+        import tempfile
+
+        base_url = (self._settings.multimodal_asr_base_url or "").rstrip("/")
+        model_name = (self._settings.multimodal_asr_model or "").strip()
+        api_key = (self._settings.multimodal_asr_api_key or "").strip()
+        if not base_url:
+            raise TranscriptionConfigurationError("Multimodal ASR base URL is not configured.")
+        if not model_name:
+            raise TranscriptionConfigurationError("Multimodal ASR model is not configured.")
+
+        request_url = f"{base_url}/chat/completions"
+        emit(
+            "transcribing",
+            52,
+            f"正在连接多模态语音识别服务 {model_name}",
+            {"provider": "multimodal", "model": model_name},
+        )
+
+        # Audio chunking config
+        CHUNK_DURATION_SECONDS = max(30, int(self._settings.multimodal_asr_chunk_duration_seconds or 180))
+        total_duration = float(duration or 0)
+        ffmpeg_exe = ffmpeg_location()
+        ffprobe_exe = None
+        if ffmpeg_exe is not None:
+            ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+            ffprobe_exe = ffmpeg_exe.parent / ffprobe_name
+        if ffprobe_exe is None or not ffprobe_exe.is_file():
+            ffprobe_which = shutil.which("ffprobe")
+            if ffprobe_which:
+                ffprobe_exe = Path(ffprobe_which)
+
+        # If duration is unknown, try to get it from ffprobe
+        if total_duration <= 0 and ffprobe_exe is not None:
+            try:
+                result = subprocess.run(
+                    [
+                        str(ffprobe_exe),
+                        "-v",
+                        "quiet",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "csv=p=0",
+                        str(audio_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                    **_windows_hidden_subprocess_kwargs(),
                 )
-        except httpx.HTTPError as exc:
-            raise VideoSumError(f"SiliconFlow ASR request failed: {exc}") from exc
+                if result.returncode == 0:
+                    total_duration = float(result.stdout.strip())
+            except Exception:
+                total_duration = 0
 
-        if response.status_code in {401, 403}:
-            detail = _extract_response_error_detail(response)
-            raise TranscriptionAuthenticationError(f"SiliconFlow ASR authentication failed: {detail}")
-        if response.status_code >= 400:
-            detail = _extract_response_error_detail(response)
-            raise VideoSumError(f"SiliconFlow ASR request failed: {detail}")
+        # Determine if chunking is needed (> 6 minutes or file > 15MB)
+        file_size = audio_path.stat().st_size
+        needs_chunking = (total_duration > 360) or (file_size > 15 * 1024 * 1024)
+        if needs_chunking and ffmpeg_exe is None:
+            raise VideoSumError("FFmpeg is unavailable, cannot split audio for multimodal ASR.")
+        if needs_chunking and total_duration <= 0:
+            raise VideoSumError("Unable to determine audio duration for multimodal ASR chunking.")
 
-        payload = response.json()
-        transcript = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
-        if not transcript:
-            raise VideoSumError("SiliconFlow ASR returned empty transcript text.")
+        mime_map = {".wav": "audio/wav", ".mp3": "audio/mp3", ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".flac": "audio/flac"}
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        def _send_audio_chunk(chunk_path: Path, chunk_offset: float, chunk_index: int, total_chunks: int) -> str:
+            """Send a single audio chunk to the multimodal ASR API with retry on empty response."""
+            with chunk_path.open("rb") as f:
+                chunk_data = f.read()
+            chunk_b64 = base64.b64encode(chunk_data).decode("utf-8")
+
+            emit(
+                "transcribing",
+                55 + int(20 * chunk_index / max(1, total_chunks)),
+                f"正在识别音频片段 {chunk_index + 1}/{total_chunks}",
+                {"provider": "multimodal", "chunk": chunk_index + 1, "total": total_chunks, "offset": chunk_offset},
+            )
+
+            chunk_ext = chunk_path.suffix.lower()
+            chunk_mime = mime_map.get(chunk_ext, "audio/wav")
+
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": f"data:{chunk_mime};base64,{chunk_b64}",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": "请转录这段音频的全部文字内容，保持原文，不要修改",
+                            },
+                        ],
+                    }
+                ],
+                "max_completion_tokens": 4096,
+            }
+
+            max_retries = max(0, int(self._settings.multimodal_asr_max_retries or 5))
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    wait_sec = 3 * (attempt + 1)
+                    logger.info("multimodal chunk %d/%d retry %d/%d (offset=%.0fs, size=%d bytes, wait=%ds)", chunk_index + 1, total_chunks, attempt + 1, max_retries, chunk_offset, len(chunk_data), wait_sec)
+                    time.sleep(wait_sec)
+
+                timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
+                with httpx.Client(timeout=timeout) as client:
+                    response = client.post(request_url, headers=headers, json=payload)
+
+                if response.status_code in {401, 403}:
+                    detail = _extract_response_error_detail(response)
+                    raise TranscriptionAuthenticationError(f"Multimodal ASR authentication failed: {detail}")
+                if response.status_code >= 400:
+                    detail = _extract_response_error_detail(response)
+                    raise VideoSumError(f"Multimodal ASR request failed: {detail}")
+
+                result = response.json()
+                transcript = ""
+                choices = result.get("choices") or []
+                if choices:
+                    message = choices[0].get("message") or {}
+                    transcript = str(message.get("content") or "").strip()
+                    if not transcript:
+                        transcript = str(message.get("reasoning_content") or "").strip()
+
+                if transcript:
+                    if attempt > 0:
+                        logger.info("multimodal chunk %d/%d succeeded on retry %d (offset=%.0fs)", chunk_index + 1, total_chunks, attempt + 1, chunk_offset)
+                    return transcript
+
+                finish_reason = choices[0].get("finish_reason", "unknown") if choices else "no_choices"
+                logger.warning("multimodal chunk %d/%d empty response (attempt %d/%d, offset=%.0fs, finish_reason=%s)", chunk_index + 1, total_chunks, attempt + 1, max_retries, chunk_offset, finish_reason)
+
+            return ""
+
+        # Reject oversized single-chunk payloads (> 12MB raw → ~16MB base64)
+        MAX_SINGLE_CHUNK_BYTES = 12 * 1024 * 1024
+        all_transcripts: list[tuple[float, float, str]] = []  # (offset, duration, text)
+
+        if not needs_chunking:
+            if file_size > MAX_SINGLE_CHUNK_BYTES:
+                raise VideoSumError(
+                    f"Audio file too large for single-chunk multimodal ASR "
+                    f"({file_size / 1024 / 1024:.1f}MB > {MAX_SINGLE_CHUNK_BYTES / 1024 / 1024:.0f}MB). "
+                    f"Please enable chunking by ensuring audio duration is known."
+                )
+            # Single chunk - send entire audio
+            emit("transcribing", 58, "正在发送音频到多模态识别服务", {"provider": "multimodal", "audio_size": file_size})
+            transcript = _send_audio_chunk(audio_path, 0.0, 0, 1)
+            if not transcript:
+                raise VideoSumError("Multimodal ASR returned empty transcript text.")
+            all_transcripts.append((0.0, total_duration or 0, transcript))
+        else:
+            # Multiple chunks - split and process with overlap to reduce
+            # missed words at boundaries.  Each chunk (except the first)
+            # starts 2s earlier so the model hears boundary audio in both
+            # adjacent chunks.  This may produce slight duplication in the
+            # merged transcript, which the LLM summariser can handle.
+            CHUNK_OVERLAP_SECONDS = 2
+            num_chunks = max(1, int(-(-total_duration // CHUNK_DURATION_SECONDS)))  # ceil division
+            emit(
+                "transcribing",
+                55,
+                f"音频较长({int(total_duration)}秒)，将分 {num_chunks} 段识别",
+                {"provider": "multimodal", "total_duration": total_duration, "chunks": num_chunks},
+            )
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                for i in range(num_chunks):
+                    chunk_start = i * CHUNK_DURATION_SECONDS
+                    chunk_duration = CHUNK_DURATION_SECONDS
+                    if i > 0:
+                        chunk_start -= CHUNK_OVERLAP_SECONDS
+                        chunk_duration += CHUNK_OVERLAP_SECONDS
+                    chunk_path = Path(tmpdir) / f"chunk_{i:03d}.mp3"
+
+                    # Re-encode to MP3 for reliable splitting and smaller file size
+                    ffmpeg_cmd = [
+                        str(ffmpeg_exe), "-y",
+                        "-i", str(audio_path),
+                        "-ss", str(chunk_start),
+                        "-t", str(chunk_duration),
+                        "-acodec", "libmp3lame",
+                        "-ab", "64k",
+                        "-ar", "16000",
+                        "-ac", "1",
+                        str(chunk_path),
+                    ]
+                    result = subprocess.run(
+                        ffmpeg_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                        **_windows_hidden_subprocess_kwargs(),
+                    )
+
+                    if not chunk_path.exists() or chunk_path.stat().st_size == 0:
+                        logger.warning("multimodal chunk %d/%d extraction failed (offset=%.0fs): %s", i + 1, num_chunks, chunk_start, result.stderr[-200:] if result.stderr else "empty output")
+                        continue
+
+                    chunk_size_kb = chunk_path.stat().st_size / 1024
+                    logger.info("multimodal chunk %d/%d extracted: offset=%.0fs, size=%.0fKB", i + 1, num_chunks, chunk_start, chunk_size_kb)
+
+                    transcript = _send_audio_chunk(chunk_path, chunk_start, i, num_chunks)
+                    if transcript:
+                        all_transcripts.append((chunk_start, chunk_duration, transcript))
+                    else:
+                        logger.warning("multimodal chunk %d/%d returned empty transcript after all retries (offset=%.0fs, size=%.0fKB)", i + 1, num_chunks, chunk_start, chunk_size_kb)
+
+        if not all_transcripts:
+            raise VideoSumError("Multimodal ASR returned empty transcript text.")
+
+        # Merge all chunk transcripts
+        full_transcript = "\n".join(text for _, _, text in all_transcripts)
 
         emit(
             "transcribing",
             78,
-            "云端语音识别完成，正在整理文本结构",
-            {"provider": "siliconflow", "transcript_chars": len(transcript)},
+            "多模态语音识别完成，正在整理文本结构",
+            {"provider": "multimodal", "transcript_chars": len(full_transcript), "chunks_processed": len(all_transcripts)},
         )
-        segments = self._build_fallback_segments_from_transcript(transcript, duration)
+
+        # Build segments with proper timestamps
+        segments: list[dict[str, object]] = []
+        for chunk_offset, chunk_dur, chunk_text in all_transcripts:
+            actual_dur = min(chunk_dur, max(1.0, total_duration - chunk_offset)) if total_duration > 0 else chunk_dur
+            chunk_segments = self._build_fallback_segments_from_transcript(chunk_text, actual_dur)
+            for seg in chunk_segments:
+                segments.append({
+                    "start": round(seg["start"] + chunk_offset, 3),
+                    "end": round(seg["end"] + chunk_offset, 3),
+                    "text": seg["text"],
+                })
+
         emit(
             "transcribing",
             84,
             f"转写完成，共整理 {len(segments)} 段",
-            {"provider": "siliconflow", "segment_count": len(segments)},
+            {"provider": "multimodal", "segment_count": len(segments)},
         )
         return self._render_transcript_from_segments(segments), segments
 
@@ -976,12 +1448,17 @@ class RealPipelineRunner(PipelineRunner):
             command.extend(["--duration", str(duration)])
 
         env = os.environ.copy()
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        env.setdefault("PYTHONUTF8", "1")
+        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+            env.pop(key, None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        pythonpath_entries = [str(path) for path in runtime_pythonpath_dirs(self._settings.runtime_channel)]
+        if pythonpath_entries:
+            env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
         runtime_paths = [str(path) for path in runtime_library_dirs(self._settings.runtime_channel)]
-        ffmpeg_dir = ffmpeg_location()
-        if ffmpeg_dir is not None:
-            runtime_paths.append(str(ffmpeg_dir))
+        ffmpeg_exe = ffmpeg_location()
+        if ffmpeg_exe is not None:
+            runtime_paths.append(str(ffmpeg_exe.parent))
         env["VIDEO_SUM_DLL_PATHS"] = os.pathsep.join(runtime_paths)
         merged_path: list[str] = []
         for entry in [*runtime_paths, *(env.get("PATH", "").split(os.pathsep))]:
@@ -1150,6 +1627,7 @@ class RealPipelineRunner(PipelineRunner):
         title: str,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
         source_kind: str | None = None,
+        prompt_preset_id: str | None = None,
     ) -> dict[str, object]:
         emit(
             "summarizing",
@@ -1168,13 +1646,23 @@ class RealPipelineRunner(PipelineRunner):
                 len(segments),
             )
             try:
-                summary = self._summarize_with_llm(
-                    transcript,
-                    segments,
-                    title,
-                    emit,
-                    source_kind=source_kind,
-                )
+                if str(prompt_preset_id or "").strip():
+                    summary = self._summarize_with_llm(
+                        transcript,
+                        segments,
+                        title,
+                        emit,
+                        source_kind=source_kind,
+                        prompt_preset_id=prompt_preset_id,
+                    )
+                else:
+                    summary = self._summarize_with_llm(
+                        transcript,
+                        segments,
+                        title,
+                        emit,
+                        source_kind=source_kind,
+                    )
                 used_llm_summary = True
             except (LLMAuthenticationError, LLMConfigurationError) as exc:
                 logger.warning("llm unavailable, fallback to rule summary reason=%s", exc)
@@ -1261,12 +1749,14 @@ class RealPipelineRunner(PipelineRunner):
         title: str,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
         source_kind: str | None = None,
+        prompt_preset_id: str | None = None,
     ) -> dict[str, object]:
         base_url = (self._settings.llm_base_url or "").rstrip("/")
         if not base_url or not self._settings.llm_model:
             raise LLMConfigurationError("LLM 配置不完整，请检查 Base URL 和模型名。")
         if source_kind == "aggregate_series":
             return self._summarize_aggregate_series_with_llm(base_url, transcript, segments, title, emit)
+        system_prompt_override, user_prompt_override = self._resolve_prompt(prompt_preset_id)
         chunks = self._build_summary_chunks(segments)
         if not chunks:
             chunks = [
@@ -1298,7 +1788,16 @@ class RealPipelineRunner(PipelineRunner):
         failures: list[str] = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             future_map = {
-                executor.submit(self._request_llm_summary_chunk, base_url, title, chunk, chunk_count, retry_count): chunk
+                executor.submit(
+                    self._request_llm_summary_chunk,
+                    base_url,
+                    title,
+                    chunk,
+                    chunk_count,
+                    retry_count,
+                    system_prompt_override,
+                    user_prompt_override,
+                ): chunk
                 for chunk in chunks
             }
             for future in as_completed(future_map):
@@ -1362,6 +1861,8 @@ class RealPipelineRunner(PipelineRunner):
                 title=title,
                 transcript_excerpt=aggregate_transcript,
                 segments_excerpt=aggregate_segments,
+                system_prompt_override=system_prompt_override,
+                user_prompt_override=user_prompt_override,
             ),
         )
         merged = self._merge_structured_summary(
@@ -1420,6 +1921,8 @@ class RealPipelineRunner(PipelineRunner):
         chunk: dict[str, object],
         chunk_count: int,
         retry_count: int,
+        system_prompt_override: str | None = None,
+        user_prompt_override: str | None = None,
     ) -> dict[str, object]:
         chunk_index = int(chunk["index"])
         last_error: Exception | None = None
@@ -1440,6 +1943,8 @@ class RealPipelineRunner(PipelineRunner):
                         title=f"{title} - 分块 {chunk_index}",
                         transcript_excerpt=str(chunk["transcript"]),
                         segments_excerpt=str(chunk["segments_json"]),
+                        system_prompt_override=system_prompt_override,
+                        user_prompt_override=user_prompt_override,
                     ),
                 )
                 partial["chunk_index"] = chunk_index
@@ -1467,17 +1972,35 @@ class RealPipelineRunner(PipelineRunner):
         timeout: float = 180,
         retry_count: int | None = None,
     ) -> dict[str, object]:
-        headers = {
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-            "Content-Type": "application/json",
-        }
+        payload = dict(payload)
+        use_anthropic = is_anthropic_llm(self._settings.llm_provider, base_url)
+        payload["model"] = (
+            str(payload.get("model") or "").strip()
+            if use_anthropic
+            else normalize_openai_compatible_model_name(str(payload.get("model") or ""))
+        )
+        if use_anthropic:
+            headers = {
+                "x-api-key": self._settings.llm_api_key,
+                "anthropic-version": ANTHROPIC_API_VERSION,
+                "Content-Type": "application/json",
+            }
+            request_url = anthropic_messages_url(base_url)
+            request_payload = build_anthropic_messages_payload(payload)
+        else:
+            headers = {
+                "Authorization": f"Bearer {self._settings.llm_api_key}",
+                "Content-Type": "application/json",
+            }
+            request_url = openai_chat_completions_url(base_url)
+            request_payload = payload
         transport_retry_count = max(0, int(self._settings.summary_chunk_retry_count if retry_count is None else retry_count))
         last_error: Exception | None = None
         response: httpx.Response | None = None
         for attempt in range(transport_retry_count + 1):
             try:
                 with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-                    response = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+                    response = client.post(request_url, headers=headers, json=request_payload)
                 break
             except Exception as exc:
                 last_error = exc
@@ -1513,17 +2036,30 @@ class RealPipelineRunner(PipelineRunner):
             raise VideoSumError(f"LLM request failed with status {status_code}: {detail}") from exc
         logger.info("llm json response status=%s model=%s", response.status_code, self._settings.llm_model)
         response_json = response.json()
-        content = response_json["choices"][0]["message"]["content"]
+        content = self._extract_llm_response_content(response_json)
         parsed = self._parse_llm_json_content(content)
         usage = response_json.get("usage") or {}
         parsed.setdefault("title", "")
         parsed.setdefault("overview", "")
         parsed.setdefault("bulletPoints", [])
         parsed.setdefault("chapters", [])
-        parsed["llm_prompt_tokens"] = _safe_int(usage.get("prompt_tokens"))
-        parsed["llm_completion_tokens"] = _safe_int(usage.get("completion_tokens"))
-        parsed["llm_total_tokens"] = _safe_int(usage.get("total_tokens"))
+        prompt_tokens = _safe_int(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        completion_tokens = _safe_int(usage.get("completion_tokens") or usage.get("output_tokens"))
+        total_tokens = _safe_int(usage.get("total_tokens"))
+        if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+        parsed["llm_prompt_tokens"] = prompt_tokens
+        parsed["llm_completion_tokens"] = completion_tokens
+        parsed["llm_total_tokens"] = total_tokens
         return parsed
+
+    def _extract_llm_response_content(self, response_json: object) -> str:
+        if not isinstance(response_json, dict):
+            raise VideoSumError("LLM returned an unexpected response payload.")
+        content = extract_llm_message_content(response_json)
+        if content:
+            return content
+        raise VideoSumError("LLM returned no readable message content.")
 
     def _preflight_llm_availability(self) -> None:
         base_url = (self._settings.llm_base_url or "").rstrip("/")
@@ -1544,6 +2080,9 @@ class RealPipelineRunner(PipelineRunner):
             ],
             "temperature": 0,
             "max_tokens": 32,
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         try:
             self._request_llm_json(base_url=base_url, payload=payload, timeout=20, retry_count=0)
@@ -1582,8 +2121,16 @@ class RealPipelineRunner(PipelineRunner):
         title: str,
         transcript_excerpt: str,
         segments_excerpt: str,
+        system_prompt_override: str | None = None,
+        user_prompt_override: str | None = None,
     ) -> dict[str, object]:
-        messages = self._build_summary_messages(title, transcript_excerpt, segments_excerpt)
+        messages = self._build_summary_messages(
+            title,
+            transcript_excerpt,
+            segments_excerpt,
+            system_prompt_override=system_prompt_override,
+            user_prompt_override=user_prompt_override,
+        )
         messages = self._ensure_json_keyword_in_messages(messages)
         # Qwen mixed-thinking models may reject json_object mode when thinking is enabled.
         return {
@@ -1591,6 +2138,7 @@ class RealPipelineRunner(PipelineRunner):
             "messages": messages,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
     def _build_aggregate_series_summary_payload(
@@ -1606,6 +2154,7 @@ class RealPipelineRunner(PipelineRunner):
             "messages": messages,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
     def _build_aggregate_series_summary_messages(
@@ -1676,21 +2225,21 @@ P 数索引：
         title: str,
         transcript_excerpt: str,
         segments_excerpt: str,
+        system_prompt_override: str | None = None,
+        user_prompt_override: str | None = None,
     ) -> list[dict[str, str]]:
         system_prompt = (
-            self._settings.summary_system_prompt.strip()
-            if self._settings.summary_system_prompt.strip()
-            else (
-                "你是一名严谨、克制、信息密度优先的中文视频内容编辑。"
-                "你的任务不是泛泛总结，而是基于转写和分段信息，产出可以直接用于“知识卡片”页面的结构化内容。"
-                "所有内容都必须忠实原文，不得编造，不得补充外部资料，不得输出 JSON 以外的任何文字。"
-                "You must return valid json only."
-            )
+            str(system_prompt_override or "").strip()
+            or self._settings.summary_system_prompt.strip()
+            or DEFAULT_SUMMARY_SYSTEM_PROMPT
         )
         user_template = (
-            self._settings.summary_user_prompt_template.strip()
-            if self._settings.summary_user_prompt_template.strip()
-            else """请阅读下面的视频资料，并输出一个 JSON 对象。
+            str(user_prompt_override or "").strip()
+            or self._settings.summary_user_prompt_template.strip()
+            or DEFAULT_SUMMARY_USER_PROMPT_TEMPLATE
+        )
+        if not user_template:
+            user_template = """请阅读下面的视频资料，并输出一个 JSON 对象。
 注意：你必须返回合法的 json 对象，且只返回 json。
 
 目标：
@@ -1746,7 +2295,6 @@ P 数索引：
 
 分段数据节选：
 {segments_json}"""
-        )
         return [
             {
                 "role": "system",
@@ -1763,6 +2311,20 @@ P 数索引：
             },
         ]
 
+    def _resolve_prompt(self, preset_id: str | None) -> tuple[str | None, str | None]:
+        normalized_id = str(preset_id or "").strip()
+        if not normalized_id:
+            return None, None
+        presets = load_presets(
+            data_dir=self._settings.data_dir,
+            prompt_presets_path=self._settings.prompt_presets_path,
+        )
+        for preset in presets:
+            if preset.id == normalized_id:
+                return preset.system_prompt, preset.user_prompt_template
+        logger.warning("prompt preset not found, fallback to settings prompt preset_id=%s", normalized_id)
+        return None, None
+
     def _build_knowledge_note_messages(
         self,
         title: str,
@@ -1770,61 +2332,25 @@ P 数索引：
         segments_excerpt: str,
         summary_json: str,
     ) -> list[dict[str, str]]:
+        system_prompt = (
+            self._settings.knowledge_note_system_prompt.strip()
+            if self._settings.knowledge_note_system_prompt.strip()
+            else DEFAULT_KNOWLEDGE_NOTE_SYSTEM_PROMPT
+        )
+        user_template = (
+            self._settings.knowledge_note_user_prompt_template.strip()
+            if self._settings.knowledge_note_user_prompt_template.strip()
+            else DEFAULT_KNOWLEDGE_NOTE_USER_PROMPT_TEMPLATE
+        )
         return [
             {
                 "role": "system",
-                "content": (
-                    "你是一名严谨、擅长整理学习型内容的中文知识编辑。"
-                    "你的任务是基于转写、分段和现有结构化摘要，单独产出一篇适合阅读的知识笔记。"
-                    "知识笔记必须比知识卡片更完整，能够承担学习、回顾和查阅任务。"
-                    "所有内容都必须忠实原文，不得编造，不得补充外部资料，不得输出 JSON 以外的任何文字。"
-                    "You must return valid json only."
-                ),
+                "content": system_prompt,
             },
             {
                 "role": "user",
                 "content": self._render_user_prompt_template(
-                    """请阅读下面的视频资料，并输出一个 JSON 对象。
-注意：你必须返回合法的 json 对象，且只返回 json。
-
-目标：
-基于原始转写和结构化摘要，生成一篇适合详情页“知识笔记”阅读视图的 Markdown 笔记。
-
-强约束：
-1. 顶层只允许包含 knowledgeNoteMarkdown 一个字段。
-2. knowledgeNoteMarkdown 必须是一篇完整 Markdown 笔记，不要输出代码围栏包裹整篇内容。
-3. 笔记必须明显区别于知识卡片：
-   - 不要只是把 bulletPoints 改写一遍；
-   - 要有连续叙述、上下文解释、章节展开和重点串联；
-   - 允许引用已有结构化摘要，但必须重新组织为适合阅读的笔记。
-4. 遇到知识类内容时，优先组织为：核心结论、关键概念、推理/方法、章节展开、易错点/限制。
-5. 遇到教程、评论、新闻等非知识类内容时，退化为通用深度笔记：主题概览、关键信息、内容推进、结论/影响。
-6. 只有在原文确实涉及公式、符号、函数、逻辑表达式时才使用 LaTeX：
-   - 行内公式使用 `$...$`
-   - 独立公式使用 `$$...$$`
-   - 不要强行输出数学公式。
-7. 不要照抄转写全文，不要把原始 transcript 直接拼进笔记主体。
-8. 不要补充外部背景，不要编造例子，不要猜测说话者未表达的动机。
-
-写作要求：
-- 标题层级清楚，便于长文阅读。
-- 保留定义、条件、因果、例子、结论、限制、争议等高价值信息。
-- 如果结构化摘要过于简略，应优先参考转写和分段把笔记写得更完整。
-
-输出格式示例：
-{{"knowledgeNoteMarkdown":"# 标题\n\n## 核心结论\n\n..."}}
-
-视频标题：
-{title}
-
-已有结构化摘要：
-{summary_json}
-
-转写节选：
-{transcript_excerpt}
-
-分段数据节选：
-{segments_excerpt}""",
+                    user_template,
                     title=title,
                     transcript_excerpt=transcript_excerpt,
                     segments_excerpt=segments_excerpt,
@@ -1943,6 +2469,7 @@ P 数索引：
             "messages": messages,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
     def _generate_knowledge_note_with_llm(
@@ -2008,6 +2535,1158 @@ P 数索引：
             encoding="utf-8",
         )
         return mindmap, mindmap_path
+
+    def build_and_export_visual_evidence(
+        self,
+        task_id: str,
+        task_input: TaskInput,
+        title: str,
+        result: TaskResult,
+        mode: str | None = None,
+        force: bool = False,
+        on_event: Callable[[PipelineEvent], None] | None = None,
+    ) -> tuple[dict[str, object], Path, Path]:
+        task_dir = ensure_directory(self._settings.tasks_dir / task_id)
+        visual_dir = task_dir / "visual_evidence"
+        if force and visual_dir.exists():
+            shutil.rmtree(visual_dir)
+        visual_dir = ensure_directory(visual_dir)
+        frames_dir = ensure_directory(visual_dir / "frames")
+        frame_index_path = visual_dir / "frame_index.json"
+        context_path = visual_dir / "visual_context.json"
+        note_path = visual_dir / "visual_note.md"
+        enhanced_note_path = visual_dir / "visual_enhanced_note.md"
+        keyframe_plan_path = visual_dir / "visual_keyframe_plan.json"
+        insert_plan_path = visual_dir / "visual_insert_plan.json"
+        mode = self._visual_note_mode(mode)
+
+        def report(stage: str, progress: int, message: str, payload: dict[str, object] | None = None) -> None:
+            if on_event is not None:
+                on_event(PipelineEvent(stage=stage, progress=progress, message=message, payload=payload or {}))
+
+        if mode == "text":
+            context = self._build_visual_context_payload(
+                task_id=task_id,
+                status="skipped",
+                source_kind="text",
+                frames=[],
+                observations=[],
+                warnings=["当前知识笔记形式为纯文本，未生成图文增强笔记。"],
+                note_path=note_path,
+                enhanced_note_path=enhanced_note_path,
+                frame_index_path=frame_index_path,
+                keyframe_plan_path=keyframe_plan_path,
+                insert_plan_path=insert_plan_path,
+                mode=mode,
+                insert_count=0,
+            )
+            self._write_json_atomic(context_path, context)
+            note_path.write_text("", encoding="utf-8")
+            enhanced_note_path.write_text("", encoding="utf-8")
+            self._write_json_atomic(keyframe_plan_path, {"schema_version": 1, "mode": mode, "keyframes": []})
+            self._write_json_atomic(insert_plan_path, {"schema_version": 1, "mode": mode, "insertions": []})
+            return context, enhanced_note_path, context_path
+
+        report("visual_keyinfo_planning", 24, "正在提取适合截图的关键信息点", {"mode": mode})
+        report("visual_source_preparing", 34, "正在并发准备视频画面来源", {"mode": mode})
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            source_future = executor.submit(self._prepare_visual_source, task_input, task_dir, title)
+            plan_future = executor.submit(self._build_visual_keyframe_plan, title, result, mode)
+            source_path, source_kind, warnings = source_future.result()
+            keyframe_plan = plan_future.result()
+        self._write_json_atomic(keyframe_plan_path, keyframe_plan)
+        keyframes = [item for item in keyframe_plan.get("keyframes", []) if isinstance(item, dict)]
+        report(
+            "visual_source_ready",
+            40,
+            "视频画面来源和截图规划已就绪",
+            {"mode": mode, "keyframe_count": len(keyframes), "source_kind": source_kind},
+        )
+
+        if source_path is None:
+            context = self._build_visual_context_payload(
+                task_id=task_id,
+                status="unsupported",
+                source_kind=source_kind,
+                frames=[],
+                observations=[],
+                warnings=warnings,
+                note_path=note_path,
+                enhanced_note_path=enhanced_note_path,
+                frame_index_path=frame_index_path,
+                keyframe_plan_path=keyframe_plan_path,
+                insert_plan_path=insert_plan_path,
+                mode=mode,
+                insert_count=0,
+            )
+            self._write_json_atomic(context_path, context)
+            note_path.write_text("", encoding="utf-8")
+            enhanced_note_path.write_text("", encoding="utf-8")
+            self._write_json_atomic(insert_plan_path, {"schema_version": 1, "mode": mode, "insertions": []})
+            return context, enhanced_note_path, context_path
+
+        timestamps = self._visual_timestamps_from_keyframe_plan(keyframe_plan, result)
+        report("visual_frame_extracting", 48, "正在按关键信息点抽取对应画面", {"mode": mode, "timestamp_count": len(timestamps)})
+        frames, extract_warnings = self._extract_visual_frames(source_path, timestamps, frames_dir)
+        warnings.extend(extract_warnings)
+        self._attach_visual_keyframe_plan(frames, keyframes)
+        report("visual_frame_extracted", 58, "关键画面抽取完成，正在整理图片索引", {"mode": mode, "frame_count": len(frames)})
+        observations: list[dict[str, object]] = []
+        if frames and mode == "vlm_integrated" and self._visual_llm_available():
+            try:
+                report("visual_frame_analyzing", 70, "正在调用 VLM 解析画面内容", {"mode": mode, "frame_count": len(frames)})
+                observations = self._describe_visual_frames(frames, title, result)
+            except Exception as exc:
+                logger.warning("visual frame description failed task_id=%s error=%s", task_id, exc)
+                warnings.append(f"视觉模型描述失败：{exc}")
+        elif frames:
+            observations = [
+                {
+                    "frame_id": str(frame["frame_id"]),
+                    "timestamp_seconds": float(frame["timestamp_seconds"]),
+                    "caption": str(frame.get("planned_caption") or frame.get("planned_concept") or "关键画面信息"),
+                    "ocr_text": "",
+                    "semantic_summary": str(frame.get("planned_note_hint") or frame.get("planned_reason") or ""),
+                    "key_facts": [],
+                    "suggested_anchor": str(frame.get("anchor_heading") or ""),
+                    "scene": "unknown",
+                    "confidence": None,
+                }
+                for frame in frames
+            ]
+        else:
+            warnings.append("未能抽取到可用关键帧。")
+
+        public_frames = [self._public_visual_frame(frame) for frame in frames]
+        frame_index = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "source_kind": source_kind,
+            "source_media_name": source_path.name,
+            "frames_dir": "frames",
+            "frames": public_frames,
+        }
+        self._write_json_atomic(frame_index_path, frame_index)
+
+        note_markdown = self._render_visual_note_markdown(observations)
+        note_path.write_text(note_markdown, encoding="utf-8")
+        report("visual_insert_planning", 82, "正在规划图片插入到笔记正文的位置", {"mode": mode})
+        insert_plan = self._build_visual_insert_plan(result, public_frames, observations, mode)
+        report("visual_note_composing", 92, "正在整合图文笔记正文", {"mode": mode, "insert_count": len(insert_plan.get("insertions", [])) if isinstance(insert_plan.get("insertions"), list) else 0})
+        enhanced_note_markdown = self._compose_visual_enhanced_note(
+            title=title,
+            result=result,
+            observations=observations,
+            insert_plan=insert_plan,
+            mode=mode,
+        )
+        enhanced_note_path.write_text(enhanced_note_markdown, encoding="utf-8")
+        self._write_json_atomic(insert_plan_path, insert_plan)
+        status = "ready" if enhanced_note_markdown.strip() and insert_plan.get("insertions") else "partial" if frames else "failed"
+        context = self._build_visual_context_payload(
+            task_id=task_id,
+            status=status,
+            source_kind=source_kind,
+            frames=public_frames,
+            observations=observations,
+            warnings=warnings,
+            note_path=note_path,
+            enhanced_note_path=enhanced_note_path,
+            frame_index_path=frame_index_path,
+            keyframe_plan_path=keyframe_plan_path,
+            insert_plan_path=insert_plan_path,
+            mode=mode,
+            insert_count=len(insert_plan.get("insertions", [])) if isinstance(insert_plan.get("insertions"), list) else 0,
+        )
+        self._write_json_atomic(context_path, context)
+        return context, enhanced_note_path, context_path
+
+    def _build_inline_visual_note(
+        self,
+        task_id: str,
+        task_input: TaskInput,
+        task_dir: Path,
+        title: str,
+        result: TaskResult,
+        emit: Callable[[str, int, str, dict[str, object] | None], None],
+    ) -> TaskResult:
+        mode = self._visual_note_mode()
+        task_mode = getattr(task_input.options, "visual_note_mode", None)
+        task_explicitly_requests_visual = False
+        if task_mode is not None:
+            mode = normalize_visual_note_mode(task_mode)
+            task_explicitly_requests_visual = mode != "text"
+        visual_enabled = self._settings.visual_evidence_enabled or task_explicitly_requests_visual
+        if not visual_enabled or mode == "text":
+            return result.model_copy(update={"visual_note_mode": mode})
+        if not result.knowledge_note_markdown.strip():
+            return result.model_copy(
+                update={
+                    "visual_note_mode": mode,
+                    "visual_note_status": "skipped",
+                    "visual_note_error_message": "纯文本知识笔记为空，已跳过图文笔记。",
+                }
+            )
+
+        started_result = result.model_copy(
+            update={
+                "visual_note_mode": mode,
+                "visual_note_status": "generating",
+                "visual_note_error_message": None,
+            }
+        )
+        emit(
+            "visual_generating",
+            20,
+            "正在生成图文笔记",
+            {"mode": mode, "result": started_result.model_dump(mode="json"), "result_scope": "visual_note"},
+        )
+
+        try:
+            def handle_visual_event(event: PipelineEvent) -> None:
+                emit(event.stage, event.progress, event.message, dict(event.payload or {}))
+
+            context, note_path, context_path = self.build_and_export_visual_evidence(
+                task_id=task_id,
+                task_input=task_input,
+                title=title,
+                result=started_result,
+                mode=mode,
+                on_event=handle_visual_event,
+            )
+        except Exception as exc:
+            logger.exception("inline visual note generation failed task_id=%s error=%s", task_id, exc)
+            failed_result = started_result.model_copy(
+                update={
+                    "visual_note_status": "failed",
+                    "visual_note_error_message": str(exc),
+                    "visual_note_updated_at": datetime.now(timezone.utc),
+                }
+            )
+            emit(
+                "visual_failed",
+                100,
+                "图文笔记生成失败，纯文本笔记已保留",
+                {"mode": mode, "error": str(exc), "result": failed_result.model_dump(mode="json"), "result_scope": "visual_note"},
+            )
+            return failed_result
+
+        status_value = str(context.get("status") or "partial")
+        warnings = [str(item) for item in context.get("warnings", []) if str(item).strip()]
+        artifacts = {
+            **started_result.artifacts,
+            "visual_enhanced_note_path": str(Path(note_path)),
+            "visual_note_path": str(Path(note_path).parent / "visual_note.md"),
+            "visual_context_path": str(Path(context_path)),
+            "visual_frame_index_path": str(Path(note_path).parent / "frame_index.json"),
+            "visual_insert_plan_path": str(Path(note_path).parent / "visual_insert_plan.json"),
+        }
+        final_result = started_result.model_copy(
+            update={
+                "artifacts": artifacts,
+                "visual_note_mode": str(context.get("mode") or mode),
+                "visual_note_status": status_value,
+                "visual_note_error_message": "\n".join(warnings) if status_value in {"failed", "partial", "unsupported"} and warnings else None,
+                "visual_note_artifact_path": str(Path(note_path).parent / "visual_note.md"),
+                "visual_enhanced_note_artifact_path": str(Path(note_path)),
+                "visual_note_updated_at": datetime.now(timezone.utc),
+                "visual_frame_count": int(context.get("frame_count") or 0),
+                "visual_insert_count": int(context.get("insert_count") or 0),
+            }
+        )
+        emit(
+            "visual_completed" if status_value == "ready" else "visual_partial",
+            100,
+            "图文笔记生成完成" if status_value == "ready" else "图文笔记已降级完成",
+            {
+                "mode": final_result.visual_note_mode,
+                "status": status_value,
+                "frame_count": final_result.visual_frame_count,
+                "insert_count": final_result.visual_insert_count,
+                "warnings": warnings,
+                "result": final_result.model_dump(mode="json"),
+                "result_scope": "visual_note",
+            },
+        )
+        return final_result
+
+    def _visual_note_mode(self, mode_override: str | None = None) -> str:
+        return normalize_visual_note_mode(mode_override or self._settings.visual_note_mode or "text")
+
+    def _build_visual_keyframe_plan(self, title: str, result: TaskResult, mode: str) -> dict[str, object]:
+        fallback = self._build_visual_keyframe_plan_locally(result, mode)
+        if not self._settings.llm_enabled or not self._settings.llm_api_key or not self._settings.llm_base_url or not self._settings.llm_model:
+            return fallback
+        try:
+            return self._build_visual_keyframe_plan_with_llm(title, result, mode)
+        except Exception as exc:
+            logger.warning("visual keyframe planning llm failed error=%s", exc)
+            return fallback
+
+    def _build_visual_keyframe_plan_locally(self, result: TaskResult, mode: str) -> dict[str, object]:
+        keyframes: list[dict[str, object]] = []
+        max_frames = max(1, min(int(self._settings.visual_evidence_max_frames or 12), 30))
+        for item in result.timeline or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = float(item.get("start") or 0)
+            except (TypeError, ValueError):
+                timestamp = 0.0
+            title = str(item.get("title") or "").strip() or "关键章节"
+            summary = str(item.get("summary") or "").strip()
+            keyframes.append(
+                {
+                    "timestamp_seconds": max(0.0, timestamp),
+                    "anchor_heading": title,
+                    "concept": title,
+                    "reason": summary or "该时间点对应知识笔记中的关键段落，适合截图辅助理解。",
+                    "caption_hint": title,
+                    "note_hint": summary,
+                    "priority": max(0.1, 1.0 - len(keyframes) * 0.04),
+                    "mode": mode,
+                }
+            )
+            if len(keyframes) >= max_frames:
+                break
+        if not keyframes:
+            keyframes = [
+                {
+                    "timestamp_seconds": timestamp,
+                    "anchor_heading": "",
+                    "concept": f"关键画面 {index + 1}",
+                    "reason": "未找到章节时间线，按固定间隔抽取画面用于辅助复盘。",
+                    "caption_hint": "关键画面",
+                    "note_hint": "",
+                    "priority": max(0.1, 1.0 - index * 0.05),
+                    "mode": mode,
+                }
+                for index, timestamp in enumerate(self._choose_visual_timestamps(result))
+            ]
+        return {"schema_version": 1, "mode": mode, "planner": "local", "keyframes": keyframes[:max_frames]}
+
+    def _build_visual_keyframe_plan_with_llm(self, title: str, result: TaskResult, mode: str) -> dict[str, object]:
+        base_url = (self._settings.llm_base_url or "").rstrip("/")
+        max_frames = max(1, min(int(self._settings.visual_evidence_max_frames or 12), 30))
+        summary_payload = {
+            "overview": result.overview,
+            "keyPoints": result.key_points,
+            "chapters": result.timeline,
+            "chapterGroups": result.chapter_groups,
+        }
+        segments_excerpt = _truncate_text(json.dumps(result.timeline, ensure_ascii=False), 6000)
+        user_template = self._settings.visual_frame_planning_prompt.strip() or (
+            "请根据视频摘要和知识笔记，选择最值得截图辅助理解的关键画面。\n"
+            "目标链路是：先找知识点 -> 按时间点截图 -> 让 VLM 理解图片 -> 整合成图文笔记。\n"
+            "只返回 JSON 对象，格式：{\"keyframes\":[{\"timestamp_seconds\":数字,\"anchor_heading\":\"应插入到的笔记标题\","
+            "\"concept\":\"被图片支撑的知识点\",\"reason\":\"为什么需要截图\",\"caption_hint\":\"图片标题建议\","
+            "\"note_hint\":\"插入笔记时应补充的说明\",\"priority\":0到1}]}。\n"
+            f"最多选择 {max_frames} 张；不要平均抽帧，只选能解释界面、代码、图表、演示、对比或步骤的画面。\n"
+            "视频标题：{title}\n模式：{mode}\n摘要 JSON：\n{summary_json}\n\n知识笔记：\n{knowledge_note_markdown}"
+        )
+        try:
+            user_prompt = user_template.format(
+                title=title,
+                mode=mode,
+                max_frames=max_frames,
+                summary_json=_truncate_text(json.dumps(summary_payload, ensure_ascii=False), 9000),
+                knowledge_note_markdown=_truncate_text(result.knowledge_note_markdown or "", 12000),
+                segments_excerpt=segments_excerpt,
+            )
+        except (KeyError, IndexError, ValueError):
+            user_prompt = (
+                f"{user_template}\n\n视频标题：{title}\n模式：{mode}\n摘要 JSON：\n"
+                f"{_truncate_text(json.dumps(summary_payload, ensure_ascii=False), 9000)}\n\n"
+                f"知识笔记：\n{_truncate_text(result.knowledge_note_markdown or '', 12000)}\n\n"
+                f"分段数据：\n{segments_excerpt}"
+            )
+        payload = {
+            "model": self._settings.llm_model,
+            "messages": [
+                {"role": "system", "content": "你是视频学习笔记的信息架构师。你只输出合法 JSON。"},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+        }
+        parsed = self._request_llm_json(base_url=base_url, payload=payload, timeout=90, retry_count=1)
+        raw_items = parsed.get("keyframes")
+        keyframes: list[dict[str, object]] = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    timestamp = float(item.get("timestamp_seconds") or item.get("timestamp") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp < 0:
+                    continue
+                try:
+                    priority = float(item.get("priority") if item.get("priority") is not None else 0.75)
+                except (TypeError, ValueError):
+                    priority = 0.75
+                keyframes.append(
+                    {
+                        "timestamp_seconds": timestamp,
+                        "anchor_heading": str(item.get("anchor_heading") or "").strip()[:160],
+                        "concept": str(item.get("concept") or item.get("caption_hint") or "关键画面").strip()[:160],
+                        "reason": str(item.get("reason") or "").strip()[:600],
+                        "caption_hint": str(item.get("caption_hint") or item.get("concept") or "关键画面").strip()[:180],
+                        "note_hint": str(item.get("note_hint") or item.get("reason") or "").strip()[:800],
+                        "priority": max(0.0, min(1.0, priority)),
+                        "mode": mode,
+                    }
+                )
+        raw_frames = parsed.get("frames")
+        if isinstance(raw_frames, list):
+            for item in raw_frames:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    timestamp = float(item.get("timestamp_seconds") or item.get("seconds") or item.get("timestamp") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if timestamp < 0:
+                    continue
+                try:
+                    raw_importance = item.get("priority") if item.get("priority") is not None else item.get("importance")
+                    priority = float(raw_importance if raw_importance is not None else 0.75)
+                    if priority > 1:
+                        priority = priority / 5
+                except (TypeError, ValueError):
+                    priority = 0.75
+                visual_type = str(item.get("expected_visual_type") or item.get("visual_type") or "").strip()
+                reason = str(item.get("reason") or "").strip()
+                keyframes.append(
+                    {
+                        "timestamp_seconds": timestamp,
+                        "anchor_heading": str(item.get("anchor_heading") or item.get("heading") or "").strip()[:160],
+                        "concept": str(item.get("concept") or item.get("caption_hint") or visual_type or "关键画面").strip()[:160],
+                        "reason": reason[:600],
+                        "caption_hint": str(item.get("caption_hint") or visual_type or item.get("concept") or "关键画面").strip()[:180],
+                        "note_hint": str(item.get("note_hint") or reason).strip()[:800],
+                        "priority": max(0.0, min(1.0, priority)),
+                        "mode": mode,
+                    }
+                )
+        if not keyframes:
+            return self._build_visual_keyframe_plan_locally(result, mode)
+        keyframes.sort(key=lambda item: float(item.get("priority") or 0), reverse=True)
+        return {"schema_version": 1, "mode": mode, "planner": "llm", "keyframes": keyframes[:max_frames]}
+
+    def _visual_timestamps_from_keyframe_plan(self, keyframe_plan: dict[str, object], result: TaskResult) -> list[float]:
+        min_interval = max(5, min(int(self._settings.visual_evidence_frame_interval_seconds or 60), 60))
+        timestamps: list[float] = []
+        for item in keyframe_plan.get("keyframes", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = max(0.0, float(item.get("timestamp_seconds") or 0))
+            except (TypeError, ValueError):
+                continue
+            if any(abs(timestamp - existing) < min_interval for existing in timestamps):
+                continue
+            timestamps.append(timestamp)
+        return timestamps or self._choose_visual_timestamps(result)
+
+    def _attach_visual_keyframe_plan(self, frames: list[dict[str, object]], keyframes: list[dict[str, object]]) -> None:
+        for frame, planned in zip(frames, keyframes):
+            frame["anchor_heading"] = str(planned.get("anchor_heading") or "").strip()
+            frame["planned_concept"] = str(planned.get("concept") or "").strip()
+            frame["planned_reason"] = str(planned.get("reason") or "").strip()
+            frame["planned_caption"] = str(planned.get("caption_hint") or planned.get("concept") or "").strip()
+            frame["planned_note_hint"] = str(planned.get("note_hint") or planned.get("reason") or "").strip()
+            frame["selection_source"] = str(planned.get("planner") or "keyframe_plan")
+
+    def _prepare_visual_source(
+        self,
+        task_input: TaskInput,
+        task_dir: Path,
+        title: str,
+    ) -> tuple[Path | None, str, list[str]]:
+        warnings: list[str] = []
+        if task_input.input_type is InputType.VIDEO_FILE:
+            source_path = Path(str(task_input.source or "")).expanduser()
+            if source_path.exists() and source_path.is_file():
+                return source_path, "local_video", warnings
+            return None, "local_video", [f"本地视频文件不存在：{source_path}"]
+        if task_input.input_type is InputType.URL:
+            try:
+                video_path = self._download_video_for_visuals(
+                    task_input.source,
+                    task_dir / "visual_evidence",
+                    sanitize_filename(title or "video"),
+                )
+                return video_path, "url_video", warnings
+            except Exception as exc:
+                logger.warning("visual video download skipped source=%s error=%s", task_input.source, exc)
+                return None, "url_video", [f"图文笔记视频源准备失败：{exc}"]
+        if task_input.input_type is InputType.AUDIO_FILE:
+            return None, "audio_file", ["音频任务没有可截图的视频画面。"]
+        return None, "transcript_text", ["纯转写任务没有可截图的视频画面。"]
+
+    def _download_video_for_visuals(self, url: str, output_dir: Path, safe_title: str) -> Path:
+        ensure_directory(output_dir)
+        output_template = str(output_dir / f"{safe_title}.visual.%(ext)s")
+        height = self._visual_download_height()
+        options = {
+            **self._base_ydl_options(),
+            "format": (
+                f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={height}]+bestaudio/"
+                f"best[height<={height}][ext=mp4]/best[height<={height}]/best"
+            ),
+            "outtmpl": output_template,
+            "noplaylist": True,
+        }
+        ffmpeg_exe = ffmpeg_location()
+        if ffmpeg_exe is not None:
+            options["ffmpeg_location"] = str(ffmpeg_exe)
+        YoutubeDL, DownloadError = _get_ytdlp_classes()
+        try:
+            with YoutubeDL(options) as ydl:
+                ydl.download([url])
+        except DownloadError as exc:
+            self._raise_ydl_error(exc)
+        candidates = sorted(output_dir.glob(f"{safe_title}.visual.*"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise VideoSumError("图文笔记视频源下载失败。")
+        return candidates[0]
+
+    def _visual_download_height(self) -> int:
+        value = str(self._settings.visual_download_resolution or "720p").strip().lower()
+        if value in {"auto", "best", "source", "original"}:
+            return 2160
+        aliases = {
+            "360p": 360,
+            "480p": 480,
+            "720p": 720,
+            "1080p": 1080,
+            "1440p": 1440,
+            "2k": 1440,
+            "2160p": 2160,
+            "4k": 2160,
+        }
+        if value in aliases:
+            return aliases[value]
+        match = re.search(r"(\d{3,4})", value)
+        if match:
+            return max(360, min(int(match.group(1)), 2160))
+        return 720
+
+    def _choose_visual_timestamps(self, result: TaskResult) -> list[float]:
+        max_frames = max(1, min(int(self._settings.visual_evidence_max_frames or 12), 30))
+        min_interval = max(10, int(self._settings.visual_evidence_frame_interval_seconds or 10))
+        candidates: list[float] = []
+        for item in result.timeline or []:
+            if not isinstance(item, dict):
+                continue
+            start = item.get("start")
+            try:
+                timestamp = float(start) if start is not None else None
+            except (TypeError, ValueError):
+                timestamp = None
+            if timestamp is not None and timestamp >= 0:
+                candidates.append(timestamp)
+        if not candidates:
+            candidates = [float(index * min_interval) for index in range(max_frames)]
+        ordered: list[float] = []
+        for timestamp in sorted(set(round(item, 1) for item in candidates)):
+            if ordered and timestamp - ordered[-1] < min_interval:
+                continue
+            ordered.append(timestamp)
+            if len(ordered) >= max_frames:
+                break
+        if not ordered and candidates:
+            ordered = [max(0.0, float(candidates[0]))]
+        return ordered[:max_frames]
+
+    def _extract_visual_frames(
+        self,
+        source_path: Path,
+        timestamps: list[float],
+        frames_dir: Path,
+    ) -> tuple[list[dict[str, object]], list[str]]:
+        warnings: list[str] = []
+        ffmpeg_exe = ffmpeg_location()
+        if ffmpeg_exe is None:
+            return [], ["FFmpeg 不可用，已跳过截图证据。"]
+        frames: list[dict[str, object]] = []
+        seen_hashes: set[str] = set()
+        width = max(320, min(int(self._settings.visual_evidence_frame_width or 960), 1600))
+        analysis_width = max(320, min(int(self._settings.visual_evidence_vlm_image_width or 768), width))
+        for index, timestamp in enumerate(timestamps, start=1):
+            frame_id = f"f{index:04d}"
+            target = frames_dir / f"{frame_id}.jpg"
+            analysis_target = frames_dir / f"{frame_id}.analysis.jpg"
+            command = [
+                str(ffmpeg_exe),
+                "-y",
+                "-ss",
+                f"{max(0.0, float(timestamp)):.3f}",
+                "-i",
+                str(source_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale='min({width},iw)':-2",
+                "-q:v",
+                "3",
+                str(target),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=45,
+                    check=False,
+                    **_windows_hidden_subprocess_kwargs(),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                warnings.append(f"{self._format_seconds(timestamp)} 截图失败：{exc}")
+                continue
+            if result.returncode != 0 or not target.exists():
+                warnings.append(f"{self._format_seconds(timestamp)} 截图失败。")
+                continue
+            if analysis_width < width:
+                analysis_command = [
+                    str(ffmpeg_exe),
+                    "-y",
+                    "-i",
+                    str(target),
+                    "-vf",
+                    f"scale='min({analysis_width},iw)':-2",
+                    "-q:v",
+                    str(self._ffmpeg_jpeg_quality_for_visual_analysis()),
+                    str(analysis_target),
+                ]
+                try:
+                    analysis_result = subprocess.run(
+                        analysis_command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=30,
+                        check=False,
+                        **_windows_hidden_subprocess_kwargs(),
+                    )
+                    if analysis_result.returncode != 0 or not analysis_target.exists():
+                        analysis_target = target
+                except (OSError, subprocess.SubprocessError):
+                    analysis_target = target
+            else:
+                analysis_target = target
+            digest = self._sha256_file(target)
+            if digest in seen_hashes:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                if analysis_target != target:
+                    try:
+                        analysis_target.unlink()
+                    except OSError:
+                        pass
+                continue
+            seen_hashes.add(digest)
+            frames.append(
+                {
+                    "frame_id": frame_id,
+                    "timestamp_seconds": float(timestamp),
+                    "timestamp": self._format_seconds(float(timestamp)),
+                    "file_name": target.name,
+                    "image_path": f"frames/{target.name}",
+                    "analysis_image_path": f"frames/{analysis_target.name}",
+                    "_absolute_path": str(target),
+                    "_analysis_absolute_path": str(analysis_target),
+                    "sha256": digest,
+                    "selected": True,
+                    "reason": "chapter_anchor",
+                }
+            )
+        return frames, warnings
+
+    def _ffmpeg_jpeg_quality_for_visual_analysis(self) -> str:
+        try:
+            quality = int(self._settings.visual_evidence_image_quality or 85)
+        except (TypeError, ValueError):
+            quality = 85
+        quality = max(1, min(quality, 100))
+        qscale = round(31 - ((quality - 1) * 29 / 99))
+        return str(max(2, min(qscale, 31)))
+
+    def _visual_llm_available(self) -> bool:
+        if not self._settings.visual_evidence_use_llm:
+            return False
+        if hasattr(self._settings, "visual_multimodal_enabled") and not self._settings.visual_multimodal_enabled:
+            return False
+        _provider, base_url, model, api_key = self._visual_llm_config()
+        return bool(base_url and model and api_key)
+
+    def _visual_llm_config(self) -> tuple[str, str, str, str]:
+        provider = (self._settings.visual_vlm_provider or "openai-compatible").strip()
+        base_url = (self._settings.visual_evidence_base_url or self._settings.llm_base_url or "").rstrip("/")
+        model = self._settings.visual_evidence_model or self._settings.llm_model
+        api_key = self._settings.visual_evidence_api_key or self._settings.llm_api_key
+        return provider, base_url, model, api_key
+
+    def _describe_visual_frames(
+        self,
+        frames: list[dict[str, object]],
+        title: str,
+        result: TaskResult,
+    ) -> list[dict[str, object]]:
+        provider, base_url, model, api_key = self._visual_llm_config()
+        observations: list[dict[str, object]] = []
+        timeline_hint = "\n".join(
+            f"- {self._format_seconds(float(item.get('start') or 0))} {str(item.get('title') or '').strip()}：{str(item.get('summary') or '').strip()}"
+            for item in (result.timeline or [])[:20]
+            if isinstance(item, dict)
+        )
+        is_anthropic = provider == "anthropic"
+        timeout = max(15, int(self._settings.visual_evidence_timeout_seconds or 120))
+        retry_count = max(0, min(int(self._settings.visual_evidence_retry_count or 1), 3))
+        for frame in frames:
+            image_path = frame.get("_analysis_absolute_path") or frame.get("_absolute_path")
+            if not image_path:
+                image_path = str(frame.get("analysis_image_path") or frame.get("image_path") or "")
+            image_file = Path(str(image_path))
+            if not image_file.exists():
+                continue
+            image_data = base64.b64encode(image_file.read_bytes()).decode("ascii")
+            prompt = self._settings.visual_vlm_prompt.strip() or (
+                "提取画面中的客观信息输出 JSON。不要叙述、不要评价、不要写「该画面」。"
+                "字段：visual_type, caption, ocr_text, key_facts, semantic_summary, importance, should_insert, "
+                "suggested_anchor, scene, confidence。"
+                "\n视频标题：{title}\n时间点：{timestamp}\n章节线索：\n{timeline_hint}"
+            )
+            try:
+                prompt = prompt.format(
+                    title=title,
+                    timestamp=frame.get("timestamp"),
+                    context=timeline_hint,
+                    timeline_hint=timeline_hint,
+                    knowledge_note_markdown=_truncate_text(result.knowledge_note_markdown or "", 4000),
+                )
+            except (KeyError, IndexError, ValueError):
+                prompt = f"{prompt}\n视频标题：{title}\n时间点：{frame.get('timestamp')}\n章节线索：\n{timeline_hint}"
+            payload: dict[str, object] = {
+                "model": model,
+                "max_tokens": 2048,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_data}",
+                                    "detail": "low",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "response_format": {"type": "json_object"},
+                "enable_thinking": False,
+            }
+            # Only use Anthropic image format for the real Anthropic API.
+            # Third-party Anthropic-compatible endpoints (e.g. SiliconFlow) do not
+            # support images via /messages — fall back to OpenAI format for those.
+            use_anthropic_images = is_anthropic and "api.anthropic.com" in base_url.lower()
+            if use_anthropic_images:
+                request_url = anthropic_messages_url(base_url)
+                headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+                request_payload = build_anthropic_messages_payload(payload)
+            else:
+                request_url = f"{base_url}/chat/completions"
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                payload["model"] = normalize_openai_compatible_model_name(model)
+                request_payload = payload
+            last_error: Exception | None = None
+            for attempt in range(retry_count + 1):
+                try:
+                    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                        response = client.post(request_url, headers=headers, json=request_payload)
+                    response.raise_for_status()
+                    body = response.json()
+                    content = extract_llm_message_content(body)
+                    parsed = json.loads(_extract_json_object_text(content))
+                    key_facts_raw = parsed.get("key_facts")
+                    key_facts: list[str] = []
+                    if isinstance(key_facts_raw, list):
+                        key_facts = [str(f).strip()[:200] for f in key_facts_raw if str(f).strip()]
+                    observations.append(
+                        {
+                            "frame_id": str(frame["frame_id"]),
+                            "timestamp_seconds": float(frame["timestamp_seconds"]),
+                            "visual_type": str(parsed.get("visual_type") or parsed.get("scene") or "unknown").strip()[:64],
+                            "caption": str(parsed.get("caption") or "关键画面信息").strip()[:240],
+                            "ocr_text": str(parsed.get("ocr_text") or "").strip()[:600],
+                            "semantic_summary": str(parsed.get("semantic_summary") or "").strip()[:600],
+                            "key_facts": key_facts,
+                            "importance": parsed.get("importance"),
+                            "should_insert": parsed.get("should_insert", True),
+                            "suggested_anchor": str(parsed.get("suggested_anchor") or "").strip()[:120],
+                            "scene": str(parsed.get("scene") or "unknown").strip()[:64],
+                            "confidence": parsed.get("confidence"),
+                        }
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= retry_count:
+                        logger.warning("visual frame llm request failed frame_id=%s error=%s", frame.get("frame_id"), exc)
+                    else:
+                        time.sleep(min(4.0, 1.2 * (attempt + 1)))
+            if last_error and not any(item.get("frame_id") == frame.get("frame_id") for item in observations):
+                observations.append(
+                    {
+                        "frame_id": str(frame["frame_id"]),
+                        "timestamp_seconds": float(frame["timestamp_seconds"]),
+                        "visual_type": "unknown",
+                        "caption": "关键画面信息",
+                        "ocr_text": "",
+                        "semantic_summary": "",
+                        "key_facts": [],
+                        "importance": None,
+                        "should_insert": True,
+                        "suggested_anchor": "",
+                        "scene": "unknown",
+                        "confidence": None,
+                    }
+                )
+        return observations
+
+    def _build_visual_insert_plan(
+        self,
+        result: TaskResult,
+        frames: list[dict[str, object]],
+        observations: list[dict[str, object]],
+        mode: str,
+    ) -> dict[str, object]:
+        observations_by_id = {str(item.get("frame_id") or ""): item for item in observations}
+        max_insertions = max(1, min(int(self._settings.visual_evidence_max_frames or 12), 30))
+        insertions: list[dict[str, object]] = []
+        for frame in frames:
+            frame_id = str(frame.get("frame_id") or "")
+            observation = observations_by_id.get(frame_id, {})
+            if mode == "vlm_integrated" and observation:
+                should_insert = bool(observation.get("should_insert", True))
+                try:
+                    importance = float(observation.get("importance") if observation.get("importance") is not None else 0.75)
+                except (TypeError, ValueError):
+                    importance = 0.75
+                if not should_insert and importance < 0.72:
+                    continue
+            chapter = self._nearest_visual_chapter(result, float(frame.get("timestamp_seconds") or 0))
+            timestamp = str(frame.get("timestamp") or self._format_seconds(float(frame.get("timestamp_seconds") or 0)))
+            anchor_heading = str(
+                observation.get("suggested_anchor")
+                or frame.get("anchor_heading")
+                or chapter.get("title")
+                or ""
+            ).strip()
+            caption = str(
+                observation.get("caption")
+                or frame.get("planned_caption")
+                or frame.get("planned_concept")
+                or chapter.get("title")
+                or "关键画面"
+            ).strip()
+            key_facts_list = observation.get("key_facts") if isinstance(observation.get("key_facts"), list) else []
+            explanation = str(
+                (". ".join(str(f) for f in key_facts_list) if key_facts_list else "")
+                or observation.get("semantic_summary")
+                or frame.get("planned_note_hint")
+                or frame.get("planned_reason")
+                or chapter.get("summary")
+                or ""
+            ).strip()
+            insertions.append(
+                {
+                    "frame_id": frame_id,
+                    "timestamp_seconds": float(frame.get("timestamp_seconds") or 0),
+                    "anchor_heading": anchor_heading,
+                    "chapter_title": str(chapter.get("title") or "").strip(),
+                    "markdown_image": f"visual://{frame_id}",
+                    "alt": f"{timestamp} {caption}",
+                    "caption": caption,
+                    "explanation": explanation[:500],
+                    "concept": str(frame.get("planned_concept") or "").strip(),
+                    "selection_reason": str(frame.get("planned_reason") or "").strip(),
+                    "mode": mode,
+                }
+            )
+            if len(insertions) >= max_insertions:
+                break
+        return {"schema_version": 1, "mode": mode, "insertions": insertions}
+
+    def _nearest_visual_chapter(self, result: TaskResult, timestamp: float) -> dict[str, object]:
+        chapters = [item for item in (result.timeline or []) if isinstance(item, dict)]
+        if not chapters:
+            return {}
+        best = chapters[0]
+        best_delta = float("inf")
+        for chapter in chapters:
+            try:
+                start = float(chapter.get("start") or 0)
+            except (TypeError, ValueError):
+                start = 0.0
+            delta = abs(timestamp - start)
+            if delta < best_delta:
+                best = chapter
+                best_delta = delta
+        return best
+
+    def _compose_visual_enhanced_note(
+        self,
+        *,
+        title: str,
+        result: TaskResult,
+        observations: list[dict[str, object]],
+        insert_plan: dict[str, object],
+        mode: str,
+    ) -> str:
+        base_note = str(result.knowledge_note_markdown or "").strip()
+        if not base_note:
+            return ""
+        if mode == "vlm_integrated" and observations and self._visual_llm_available():
+            try:
+                model_note = self._compose_visual_note_with_llm(title, base_note, observations, insert_plan)
+                if self._visual_note_preserves_text_subject(model_note):
+                    return model_note
+                logger.warning("visual enhanced note llm composition rejected because text subject was not preserved")
+            except Exception as exc:
+                logger.warning("visual enhanced note llm composition failed error=%s", exc)
+        return self._compose_visual_note_locally(base_note, insert_plan)
+
+    def _visual_note_preserves_text_subject(self, markdown: str) -> bool:
+        text = str(markdown or "").strip()
+        if "visual://" not in text:
+            return False
+        image_count = len(re.findall(r"!\[[^\]]*\]\(visual://[^)]+\)", text))
+        if image_count <= 0:
+            return False
+        text_without_images = re.sub(r"!\[[^\]]*\]\(visual://[^)]+\)", "", text)
+        text_chars = len(re.sub(r"\s+", "", text_without_images))
+        return text_chars >= max(180, image_count * 80)
+
+    def _compose_visual_note_with_llm(
+        self,
+        title: str,
+        knowledge_note_markdown: str,
+        observations: list[dict[str, object]],
+        insert_plan: dict[str, object] | None = None,
+    ) -> str:
+        provider, base_url, model, api_key = self._visual_llm_config()
+        is_anthropic = provider == "anthropic"
+        system_prompt = self._settings.visual_note_system_prompt.strip() or (
+            "你是一名擅长将截图与文字深度整合的中文技术编辑。只输出 Markdown 正文。"
+            "输出必须是段落→图片→段落的交替结构，只选最重要的 3-6 张图。"
+            "绝对禁止图片堆积在末尾，禁止使用「画面呈现」「该画面」「上图」等流水账句式。"
+        )
+        payload_observations = []
+        for item in observations:
+            frame_id = str(item.get("frame_id") or "")
+            if not frame_id:
+                continue
+            # Pre-filter: only send frames that are likely to be inserted.
+            # Low-importance frames bloat the prompt and confuse the model.
+            should_insert = item.get("should_insert")
+            if should_insert is not None and not should_insert:
+                continue
+            try:
+                importance = float(item.get("importance") if item.get("importance") is not None else 3)
+            except (TypeError, ValueError):
+                importance = 3
+            if importance < 2.5:
+                continue
+            payload_observations.append(
+                {
+                    **{key: value for key, value in item.items() if not str(key).startswith("_")},
+                    "markdown_image": f"visual://{frame_id}",
+                }
+            )
+        user_template = self._settings.visual_note_user_prompt_template.strip() or (
+            "请以画面客观信息为参考重新整合知识笔记，图片链接使用 observations 中的 markdown_image。\n"
+            "核心规则：输出必须是 段落1→图1→段落2→图2 交替模式，只选 3-6 张最重要的图，禁止图片堆在末尾。\n"
+            "要求：以知识点为叙事主线；精简合并重复内容；禁止「画面呈现」「该画面」「上图」等句式；"
+            "图片插入后用 1-2 句自然过渡；key_facts/semantic_summary 转化为自己的语言。\n"
+            "标题：{title}\n原始知识笔记：\n{knowledge_note_markdown}\n视觉解析 JSON：\n{visual_observations_json}"
+        )
+        if insert_plan:
+            insertions_by_id = {
+                str(item.get("frame_id") or ""): item
+                for item in insert_plan.get("insertions", [])
+                if isinstance(item, dict)
+            }
+            for item in payload_observations:
+                plan_item = insertions_by_id.get(str(item.get("frame_id") or ""))
+                if plan_item:
+                    item["insert_plan"] = plan_item
+        visual_observations_json = json.dumps(payload_observations, ensure_ascii=False, indent=2)
+        # Truncate large inputs to keep compose prompt under reasonable token limits.
+        # Long knowledge notes and many observations cause timeouts on reasoning models.
+        truncated_note = _truncate_text(knowledge_note_markdown, 8000)
+        truncated_obs = _truncate_text(visual_observations_json, 12000)
+        try:
+            user_prompt = user_template.format(
+                title=title,
+                knowledge_note_markdown=truncated_note,
+                visual_observations_json=truncated_obs,
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            logger.warning("visual note prompt template format failed error=%s", exc)
+            user_prompt = (
+                f"{user_template}\n\n"
+                f"标题：{title}\n"
+                f"原始知识笔记：\n{knowledge_note_markdown}\n\n"
+                f"视觉解析 JSON：\n{visual_observations_json}"
+            )
+        openai_payload: dict[str, object] = {
+            "model": normalize_openai_compatible_model_name(model),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.5,
+            "max_tokens": 65536,
+            "enable_thinking": True,
+        }
+        if is_anthropic:
+            headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+            request_url = anthropic_messages_url(base_url)
+            request_payload = build_anthropic_messages_payload(openai_payload)
+        else:
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            request_url = f"{base_url}/chat/completions"
+            request_payload = openai_payload
+        # Compose step processes the full knowledge note + all observations — can take a while.
+        compose_timeout = max(60, int(self._settings.visual_evidence_timeout_seconds or 300))
+        with httpx.Client(timeout=compose_timeout, follow_redirects=True) as client:
+            response = client.post(request_url, headers=headers, json=request_payload)
+        response.raise_for_status()
+        body = response.json()
+        content = extract_llm_message_content(body)
+        if not content:
+            raise VideoSumError("图文笔记模型返回空内容。")
+        return content
+
+    def _compose_visual_note_locally(self, knowledge_note_markdown: str, insert_plan: dict[str, object]) -> str:
+        insertions = [item for item in insert_plan.get("insertions", []) if isinstance(item, dict)]
+        if not insertions:
+            return knowledge_note_markdown
+        lines = knowledge_note_markdown.splitlines()
+        output: list[str] = []
+        insertion_index = 0
+        for line in lines:
+            stripped = line.strip()
+            is_heading = stripped.startswith("#")
+            output.append(line)
+            if insertion_index >= len(insertions):
+                continue
+            current = insertions[insertion_index]
+            anchor = str(current.get("anchor_heading") or current.get("chapter_title") or "").strip()
+            if not is_heading or not anchor:
+                continue
+            heading_text = re.sub(r"^#+\s*", "", stripped).strip()
+            shorter, longer = sorted((len(anchor), len(heading_text)))
+            if (anchor in heading_text or heading_text in anchor) and shorter >= longer * 0.6:
+                output.extend(self._format_visual_insertion_markdown(current))
+                insertion_index += 1
+        return "\n".join(output).strip()
+
+    def _format_visual_insertion_markdown(self, insertion: dict[str, object]) -> list[str]:
+        image = str(insertion.get("markdown_image") or "").strip()
+        alt = str(insertion.get("alt") or insertion.get("caption") or "关键画面").strip()
+        explanation = str(insertion.get("explanation") or "").strip()
+        if not image:
+            return []
+        lines = ["", f"![{alt}]({image})"]
+        if explanation:
+            lines.extend(["", f"> {explanation}"])
+        lines.append("")
+        return lines
+
+    def _render_visual_note_markdown(self, observations: list[dict[str, object]]) -> str:
+        if not observations:
+            return ""
+        sections = ["## 图文笔记素材"]
+        for item in observations:
+            timestamp = self._format_seconds(float(item.get("timestamp_seconds") or 0))
+            frame_id = str(item.get("frame_id") or "")
+            caption = str(item.get("caption") or "关键画面截图").strip()
+            ocr_text = str(item.get("ocr_text") or "").strip()
+            image_name = f"{frame_id}.jpg" if frame_id else ""
+            sections.append("")
+            sections.append(f"### {timestamp} {caption}")
+            if image_name:
+                sections.append(f"![{timestamp} {caption}](frames/{image_name})")
+            if ocr_text:
+                sections.append("")
+                sections.append(f"- 画面文字：{ocr_text}")
+        return "\n".join(sections).strip()
+
+    def _public_visual_frame(self, frame: dict[str, object]) -> dict[str, object]:
+        return {key: value for key, value in frame.items() if not str(key).startswith("_")}
+
+    def _build_visual_context_payload(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        source_kind: str,
+        frames: list[dict[str, object]],
+        observations: list[dict[str, object]],
+        warnings: list[str],
+        note_path: Path,
+        enhanced_note_path: Path,
+        frame_index_path: Path,
+        keyframe_plan_path: Path,
+        insert_plan_path: Path,
+        mode: str,
+        insert_count: int,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "task_id": task_id,
+            "status": status,
+            "source_kind": source_kind,
+            "provider": "openai_compatible" if self._visual_llm_available() else "none",
+            "model": self._visual_llm_config()[2] if self._visual_llm_available() else "",
+            "visual_note_path": note_path.name,
+            "visual_enhanced_note_path": enhanced_note_path.name,
+            "frame_index_path": frame_index_path.name,
+            "visual_keyframe_plan_path": keyframe_plan_path.name,
+            "visual_insert_plan_path": insert_plan_path.name,
+            "frame_count": len(observations),
+            "insert_count": insert_count,
+            "mode": mode,
+            "frames": frames,
+            "observations": observations,
+            "warnings": warnings,
+        }
+
+    def _write_json_atomic(self, path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _sha256_file(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _build_mindmap_messages(
         self,
@@ -2106,6 +3785,7 @@ P 数索引：
             "messages": messages,
             "response_format": {"type": "json_object"},
             "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
     def _generate_mindmap_with_llm(

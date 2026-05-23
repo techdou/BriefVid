@@ -3,7 +3,6 @@ from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
-
 from video_sum_core.models.tasks import MindMapNode, TaskInput, TaskMindMap, TaskResult, TaskStatus
 from video_sum_core.utils import extract_bilibili_page
 
@@ -19,11 +18,14 @@ class ResummaryRequest(BaseModel):
 
 class VideoTaskCreateRequest(BaseModel):
     page_number: int | None = None
+    visual_note_mode: str | None = None
+    prompt_preset_id: str | None = None
 
 
 class VideoTaskBatchRequest(BaseModel):
     page_numbers: list[int] = Field(default_factory=list)
     confirm: bool = False
+    prompt_preset_id: str | None = None
 
 
 class AggregateSummaryRequest(BaseModel):
@@ -32,6 +34,43 @@ class AggregateSummaryRequest(BaseModel):
 
 class TaskMarkdownExportRequest(BaseModel):
     target: Literal["markdown", "obsidian"] = "obsidian"
+    include_transcript: bool = False
+    output_dir: str | None = None
+
+
+class TaskTranscriptExportRequest(BaseModel):
+    output_dir: str | None = None
+
+
+class PromptPresetResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    category: str | None = None
+    icon: str | None = None
+    system_prompt: str
+    user_prompt_template: str
+    auto_match_keywords: list[str] = Field(default_factory=list)
+    is_builtin: bool = False
+
+
+class PromptMatchRequest(BaseModel):
+    title: str
+
+
+class PromptMatchResponse(BaseModel):
+    preset: PromptPresetResponse
+    match_type: str
+    confidence: float
+
+
+class PromptPresetCreateRequest(BaseModel):
+    name: str
+    system_prompt: str
+    user_prompt_template: str
+    description: str | None = None
+    category: str | None = None
+    auto_match_keywords: list[str] = Field(default_factory=list)
 
 
 class VideoTaskBatchPageResponse(BaseModel):
@@ -174,9 +213,22 @@ class TaskMindMapResponse(BaseModel):
     mindmap: TaskMindMap | None = None
 
 
+class TaskVisualEvidenceResponse(BaseModel):
+    task_id: str
+    mode: str = "text"
+    status: str = "idle"
+    error_message: str | None = None
+    updated_at: datetime | None = None
+    frame_count: int = 0
+    insert_count: int = 0
+    visual_note_markdown: str = ""
+    enhanced_note_markdown: str = ""
+    context: dict[str, object] | None = None
+
+
 class TaskMarkdownExportResponse(BaseModel):
     task_id: str
-    target_format: Literal["markdown", "obsidian"]
+    target_format: Literal["markdown", "obsidian", "transcript"]
     path: str
     directory: str
     file_name: str

@@ -31,6 +31,7 @@ export function renderSettingsView(state) {
   const settings = state.settings || {};
   const info = state.systemInfo || {};
   const env = state.environment || {};
+  const transcriptionProvider = settings.transcription_provider || "siliconflow";
 
   return `
     <section class="settings-grid">
@@ -52,7 +53,7 @@ export function renderSettingsView(state) {
         <section class="env-panel">
           <div class="env-panel-head">
             <span class="env-panel-kicker">Environment Snapshot</span>
-            <p>当前硬件、依赖版本和运行时建议一览</p>
+            <p>当前硬件、依赖版本和运行环境建议一览</p>
           </div>
           <div class="env-summary-grid">
             ${renderEnvCard("推荐设备", env.recommendedDevice || "-", "cpu")}
@@ -64,9 +65,9 @@ export function renderSettingsView(state) {
             ${renderEnvCard("本地 ASR", env.localAsrInstalled ? (env.localAsrVersion || "已安装") : "未安装", env.localAsrInstalled ? "success" : "neutral")}
             ${renderEnvCard("FFmpeg", env.ffmpegLocation ? `已安装 (${escapeHtml(env.ffmpegLocation)})` : "未安装", env.ffmpegLocation ? "success" : "warning")}
             ${renderEnvCard("Python", env.pythonVersion || "-", "neutral")}
-            ${renderEnvCard("运行时通道", env.runtimeChannel || settings.runtime_channel || "base", "neutral")}
-            ${renderEnvCard("运行时状态", env.runtimeReady === false ? "未就绪" : "已就绪", env.runtimeReady === false ? "warning" : "success")}
-            ${renderEnvCard("运行时解释器", env.runtimePython || "未检测到", env.runtimePython ? "success" : "neutral")}
+            ${renderEnvCard("运行环境通道", env.runtimeChannel || settings.runtime_channel || "base", "neutral")}
+            ${renderEnvCard("运行环境状态", env.runtimeReady === false ? "未就绪" : "已就绪", env.runtimeReady === false ? "warning" : "success")}
+            ${renderEnvCard("运行环境解释器", env.runtimePython || "未检测到", env.runtimePython ? "success" : "neutral")}
           </div>
         </section>
 
@@ -75,7 +76,7 @@ export function renderSettingsView(state) {
           <div class="cuda-control-copy">
             <span class="env-panel-kicker">CUDA Control</span>
             <h3>CUDA 目标版本</h3>
-            <p>选择目标运行时后，可重新检测环境或安装对应 CUDA 支持。</p>
+            <p>选择目标运行环境后，可重新检测环境或安装对应 CUDA 支持。</p>
           </div>
           <div class="cuda-actions">
             <label class="input-row cuda-picker">
@@ -112,16 +113,16 @@ export function renderSettingsView(state) {
           ` : ''}
           ${env.runtimeError ? `
             <label class="input-row">
-              <span class="input-label">运行时错误详情</span>
+              <span class="input-label">运行环境错误详情</span>
               <textarea class="textarea-field log-viewer" rows="8" readonly>${escapeHtml(env.runtimeError)}</textarea>
             </label>
           ` : ''}
           <label class="input-row">
-            <span class="input-label">本地 ASR 运行时</span>
+            <span class="input-label">本地 ASR 运行环境</span>
             <div class="settings-actions">
               <button id="install-local-asr" class="secondary-button" type="button">安装本地 ASR</button>
             </div>
-            <span class="input-caption">${env.localAsrInstalled ? `当前已安装 ${escapeHtml(env.localAsrVersion || "")}，安装后会自动切换到本地模式。` : "正式安装包默认不包含本地 ASR；安装到当前运行时后会自动切换到本地模式。"}</span>
+            <span class="input-caption">${env.localAsrInstalled ? `当前已安装 ${escapeHtml(env.localAsrVersion || "")}，安装后会自动切换到本地模式。` : "正式安装包默认不包含本地 ASR；安装到当前运行环境后会自动切换到本地模式。"}</span>
           </label>
           ${renderStatusNotice(state.localAsrActionStatus, "localAsrActionStatus")}
           ${state.localAsrInstallOutput ? `
@@ -156,14 +157,15 @@ export function renderSettingsView(state) {
             ${renderInput("cache_dir", "缓存目录", settings.cache_dir || "", "text", "/path/to/cache")}
             ${renderInput("tasks_dir", "任务目录", settings.tasks_dir || "", "text", "/path/to/tasks")}
             ${renderInput("database_url", "数据库", settings.database_url || "", "text", "sqlite:///data.db")}
-            ${renderSelect("runtime_channel", "运行时通道", settings.runtime_channel || "base", buildRuntimeChannelOptions(settings))}
+            ${renderSelect("runtime_channel", "运行环境通道", settings.runtime_channel || "base", buildRuntimeChannelOptions(settings))}
           </section>
 
           <!-- 转写模型 -->
           <section class="settings-subsection">
             <h3>转写模型</h3>
-            ${renderSelect("transcription_provider", "转写方式", settings.transcription_provider || "siliconflow", [
+            ${renderSelect("transcription_provider", "转写方式", transcriptionProvider, [
               { value: "siliconflow", label: "硅基流动 API" },
+              { value: "multimodal", label: "多模态 ASR (第三方)" },
               ...(env.localAsrInstalled ? [{ value: "local", label: "本地 ASR" }] : [])
             ])}
             ${renderSelect("device_preference", "推理设备", settings.device_preference || "cpu", [
@@ -186,9 +188,30 @@ export function renderSettingsView(state) {
               { value: "base", label: "Base (平衡)" },
               { value: "large-v3-turbo", label: "Large v3 Turbo (最准)" }
             ])}
-            ${renderInput("siliconflow_asr_base_url", "SiliconFlow Base URL", settings.siliconflow_asr_base_url || "https://api.siliconflow.cn/v1", "text", "https://api.siliconflow.cn/v1")}
-            ${renderInput("siliconflow_asr_model", "SiliconFlow ASR 模型", settings.siliconflow_asr_model || "TeleAI/TeleSpeechASR", "text", "TeleAI/TeleSpeechASR")}
-            ${renderSiliconFlowApiKeyInput(settings.siliconflow_asr_api_key || "")}
+
+            <div class="asr-config-group" data-provider="siliconflow" ${transcriptionProvider === "siliconflow" ? "" : "hidden"}>
+              <div class="subsection-divider"><span>硅基流动 ASR 配置</span></div>
+              ${renderInput("siliconflow_asr_base_url", "SiliconFlow Base URL", settings.siliconflow_asr_base_url || "https://api.siliconflow.cn/v1", "text", "https://api.siliconflow.cn/v1")}
+              ${renderInput("siliconflow_asr_model", "SiliconFlow ASR 模型", settings.siliconflow_asr_model || "TeleAI/TeleSpeechASR", "text", "TeleAI/TeleSpeechASR")}
+              ${renderSiliconFlowApiKeyInput(settings.siliconflow_asr_api_key || "")}
+              ${renderInput("siliconflow_asr_chunk_duration_seconds", "切片时长（秒）", settings.siliconflow_asr_chunk_duration_seconds ?? 1800, "number", "1800")}
+              <span class="input-caption" style="margin-top:-4px;margin-bottom:12px;display:block;color:var(--text-secondary);">长音频按此时长切片，默认 1800 秒（30 分钟）。</span>
+              ${renderInput("siliconflow_asr_concurrency", "并发数", settings.siliconflow_asr_concurrency ?? 2, "number", "2")}
+              <span class="input-caption" style="margin-top:-4px;margin-bottom:12px;display:block;color:var(--text-secondary);">同时发送的转写请求数，默认 2。</span>
+            </div>
+
+            <div class="asr-config-group" data-provider="multimodal" ${transcriptionProvider === "multimodal" ? "" : "hidden"}>
+              <div class="subsection-divider"><span>多模态 ASR 配置</span></div>
+              <span class="input-caption" style="margin-bottom:8px;display:block;color:var(--text-secondary);">使用多模态大模型（如 mimo-v2-omni）通过 chat/completions 接口进行语音转文字。</span>
+              ${renderInput("multimodal_asr_base_url", "多模态 ASR Base URL", settings.multimodal_asr_base_url || "", "text", "https://fufu.iqach.top/v1")}
+              ${renderInput("multimodal_asr_model", "多模态 ASR 模型", settings.multimodal_asr_model || "mimo-v2-omni", "text", "mimo-v2-omni")}
+              ${renderInput("multimodal_asr_api_key", "多模态 ASR API Key", settings.multimodal_asr_api_key || "", "password", "如有则填写", "current-password")}
+              ${renderInput("multimodal_asr_chunk_duration_seconds", "切片时长（秒）", settings.multimodal_asr_chunk_duration_seconds ?? 180, "number", "180")}
+              <span class="input-caption" style="margin-top:-4px;margin-bottom:12px;display:block;color:var(--text-secondary);">长音频自动切片的每段秒数，默认 180 秒。</span>
+              ${renderInput("multimodal_asr_max_retries", "切片重试次数", settings.multimodal_asr_max_retries ?? 5, "number", "5")}
+              <span class="input-caption" style="margin-top:-4px;margin-bottom:12px;display:block;color:var(--text-secondary);">每段切片返回空时最多重试几次，默认 5 次。</span>
+            </div>
+
             ${renderInput("language", "语言", settings.language || "", "text", "zh")}
           </section>
 
@@ -230,6 +253,36 @@ export function renderSettingsView(state) {
             ${renderTextarea("summary_user_prompt_template", "用户提示词模板", settings.summary_user_prompt_template || "", 6)}
           </section>
 
+          <!-- 知识库 LLM -->
+          <section class="settings-subsection">
+            <h3>知识库 LLM</h3>
+            <label class="toggle-row">
+              <span>启用知识库</span>
+              <input id="knowledge_enabled" type="checkbox" ${settings.knowledge_enabled ? "checked" : ""} />
+            </label>
+            ${renderSelect("knowledge_index_auto_rebuild", "自动维护知识库索引", settings.knowledge_index_auto_rebuild || "disabled", [
+              { value: "disabled", label: "关闭自动维护" },
+              { value: "on_task_completed", label: "视频生成结束后更新索引" }
+            ])}
+            ${renderSelect("knowledge_llm_mode", "知识库 LLM 来源", settings.knowledge_llm_mode || "same_as_main", [
+              { value: "same_as_main", label: "跟随主 LLM" },
+              { value: "custom", label: "使用独立配置" }
+            ])}
+            <label class="toggle-row">
+              <span>启用独立知识库 LLM</span>
+              <input id="knowledge_llm_enabled" type="checkbox" ${settings.knowledge_llm_enabled ? "checked" : ""} />
+            </label>
+            ${renderSelect("knowledge_llm_provider", "LLM 提供商", settings.knowledge_llm_provider || "openai-compatible", [
+              { value: "openai-compatible", label: "OpenAI Compatible" },
+              { value: "openai", label: "OpenAI" },
+              { value: "anthropic", label: "Anthropic" },
+              { value: "custom", label: "自建端点" }
+            ])}
+            ${renderInput("knowledge_llm_base_url", "API Base URL", settings.knowledge_llm_base_url || "", "text", "https://api.openai.com/v1")}
+            ${renderInput("knowledge_llm_model", "模型名称", settings.knowledge_llm_model || "", "text", "gpt-4o-mini / claude-3-haiku")}
+            ${renderInput("knowledge_llm_api_key", "API Key", settings.knowledge_llm_api_key || "", "password", "sk-...", "current-password")}
+          </section>
+
           <!-- 保存按钮 -->
           <section class="settings-subsection settings-actions-section">
             <div class="settings-actions">
@@ -264,13 +317,18 @@ export function renderSettingsView(state) {
         </div>
         <div class="setting-list">
           ${renderRow("LLM 启用", settings.llm_enabled ? "✓ 是" : "✗ 否", settings.llm_enabled ? "success" : "neutral")}
-          ${renderRow("转写方式", settings.transcription_provider === "siliconflow" ? "硅基流动 API" : "本地 ASR", settings.transcription_provider === "siliconflow" ? "success" : "neutral")}
+          ${renderRow("转写方式", transcriptionProvider === "siliconflow" ? "硅基流动 API" : transcriptionProvider === "multimodal" ? "多模态 ASR" : "本地 ASR", transcriptionProvider === "siliconflow" || transcriptionProvider === "multimodal" ? "success" : "neutral")}
+          ${transcriptionProvider === "multimodal" ? `
+          ${renderRow("多模态模型", settings.multimodal_asr_model || "-", settings.multimodal_asr_model ? "success" : "neutral")}
+          ${renderRow("多模态 API Key", settings.multimodal_asr_api_key_configured ? "✓ 已配置" : "✗ 未配置", settings.multimodal_asr_api_key_configured ? "success" : "warning")}
+          ` : `
           ${renderRow("SiliconFlow 模型", settings.siliconflow_asr_model || "-", settings.siliconflow_asr_model ? "success" : "neutral")}
           ${renderRow("SiliconFlow API Key", settings.siliconflow_asr_api_key_configured ? "✓ 已配置" : "✗ 未配置", settings.siliconflow_asr_api_key_configured ? "success" : "warning")}
+          `}
           ${renderRow("本地 ASR", env.localAsrInstalled ? `✓ 已安装${env.localAsrVersion ? ` (${env.localAsrVersion})` : ""}` : "✗ 未安装", env.localAsrInstalled ? "success" : "neutral")}
           ${renderRow("LLM Base URL", settings.llm_base_url || "-", settings.llm_base_url ? "success" : "neutral")}
           ${renderRow("LLM 模型", settings.llm_model || "-", settings.llm_model ? "success" : "neutral")}
-          ${renderRow("运行时通道", settings.runtime_channel || "base", "neutral")}
+          ${renderRow("运行环境通道", settings.runtime_channel || "base", "neutral")}
           ${renderRow("摘要模式", settings.summary_mode || "-", "neutral")}
           ${renderRow("分块大小", String(settings.summary_chunk_target_chars || "-"), "neutral")}
           ${renderRow("分块并发", String(settings.summary_chunk_concurrency || "-"), "neutral")}
@@ -465,7 +523,7 @@ function renderTextarea(id, label, value, rows) {
 
 function buildRuntimeChannelOptions(settings) {
   const options = [
-    { value: "base", label: "base (CPU 基础运行时)" },
+    { value: "base", label: "base (CPU 基础运行环境)" },
   ];
   for (const value of ["gpu-cu124", "gpu-cu126", "gpu-cu128"]) {
     options.push({

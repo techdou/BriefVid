@@ -9,10 +9,11 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from yt_dlp import YoutubeDL
 
+from video_sum_service.auth import is_auth_exempt_path, request_is_authorized, unauthorized_response
 from video_sum_core.models.tasks import TaskStatus
 from video_sum_infra.db import connect_sqlite
+from video_sum_infra.config import normalize_visual_note_mode
 from video_sum_infra.runtime import (
     activate_runtime_pythonpath,
     bootstrap_managed_runtime,
@@ -23,8 +24,8 @@ from video_sum_infra.runtime import (
     write_runtime_metadata,
 )
 
-from video_sum_service.context import CACHE_STATIC_DIR, WEB_STATIC_DIR, app_info, logger, settings_manager
-from video_sum_service.integrations import cache_cover_image, probe_asr_connection, probe_llm_connection
+from video_sum_service.context import CACHE_STATIC_DIR, WEB_STATIC_DIR, access_token_manager, app_info, logger, settings_manager
+from video_sum_service.integrations import probe_asr_connection, probe_llm_connection
 from video_sum_service.repository import SqliteTaskRepository
 from video_sum_service.routers.system import router as system_router
 from video_sum_service.routers.knowledge import router as knowledge_router
@@ -42,9 +43,17 @@ from video_sum_service.runtime_support import (
     run_command,
     serialize_settings,
 )
-from video_sum_service.schemas import TaskMindMapResponse
+from video_sum_service.runtime_startup import (
+    get_runtime_startup_state,
+    initialize_runtime_startup_state,
+    mark_runtime_worker_ready,
+    request_runtime_startup_shutdown,
+    start_runtime_startup,
+    submit_mindmap_or_queue,
+)
+from video_sum_service.schemas import TaskMindMapResponse, TaskVisualEvidenceResponse
 from video_sum_service.settings_manager import SettingsUpdatePayload
-from video_sum_service.task_artifacts import cleanup_video_files, load_task_mindmap
+from video_sum_service.task_artifacts import cleanup_video_files, load_task_mindmap, load_visual_context, load_visual_note_markdown
 import video_sum_service.video_assets as video_assets
 
 probe_video_asset = video_assets.probe_video_asset
@@ -76,14 +85,7 @@ def _run_host_command(command: list[str], timeout: int = 3600):
 
 
 def recover_incomplete_tasks(repository: SqliteTaskRepository, task_worker) -> int:
-    recoverable = sorted(
-        (
-            record
-            for record in repository.list_tasks()
-            if record.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
-        ),
-        key=lambda record: (record.created_at, record.task_id),
-    )
+    recoverable = repository.list_recoverable_tasks()
     if not recoverable:
         return 0
 
@@ -103,25 +105,25 @@ def recover_incomplete_tasks(repository: SqliteTaskRepository, task_worker) -> i
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     current_settings = settings_manager.current
-    bootstrap_managed_runtime(current_settings.runtime_channel)
-    prepend_runtime_path(current_settings.runtime_channel)
-    activate_runtime_pythonpath(current_settings.runtime_channel)
     connection = connect_sqlite(current_settings.database_url)
     repository = SqliteTaskRepository(connection)
     repository.initialize()
     app.state.task_repository = repository
-    task_worker = build_worker(repository=repository, current_settings=current_settings)
-    replace_task_worker(app.state, task_worker)
     app.state.db_connection = connection
     app.state.settings_manager = settings_manager
-    recover_incomplete_tasks(repository, task_worker)
-    logger.info("application startup complete database=%s", current_settings.database_url)
+    initialize_runtime_startup_state(app.state, current_settings)
+    start_runtime_startup(app.state, repository, current_settings, recover_incomplete_tasks)
+    logger.info("application core startup complete database=%s", current_settings.database_url)
     try:
         yield
     finally:
+        request_runtime_startup_shutdown(app.state)
+        startup_thread = getattr(app.state, "runtime_startup_thread", None)
+        if startup_thread is not None and startup_thread.is_alive():
+            startup_thread.join(timeout=10)
         task_worker = getattr(app.state, "task_worker", None)
-        if task_worker is not None:
-            task_worker.shutdown(wait=False)
+        if task_worker is not None and hasattr(task_worker, "shutdown"):
+            task_worker.shutdown(wait=True, timeout=10)
         logger.info("application shutdown")
         connection.close()
 
@@ -138,6 +140,15 @@ app.include_router(system_router)
 app.include_router(videos_router)
 app.include_router(tasks_router)
 app.include_router(knowledge_router)
+
+
+@app.middleware("http")
+async def require_api_access_token(request, call_next):
+    path = request.url.path
+    if path.startswith("/api/v1/") and not is_auth_exempt_path(path, request.method):
+        if not request_is_authorized(request, access_token_manager):
+            return unauthorized_response()
+    return await call_next(request)
 
 
 def frontend_shell_response() -> FileResponse:
@@ -177,8 +188,16 @@ def knowledge_page(subpath: str = "") -> FileResponse:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": app_info.name, "version": app_info.version}
+def health() -> dict[str, object]:
+    runtime_startup = get_runtime_startup_state(app.state)
+    runtime_status = str(runtime_startup.get("status") or "initializing")
+    status_value = "ok" if runtime_status == "ready" else "degraded" if runtime_status == "error" else "starting"
+    return {
+        "status": status_value,
+        "service": app_info.name,
+        "version": app_info.version,
+        "runtime_startup": runtime_startup,
+    }
 
 
 def _run_command(command: list[str], runtime_channel: str, timeout: int = 3600):
@@ -251,6 +270,7 @@ def update_settings(payload: SettingsUpdatePayload) -> dict[str, object]:
             environment_info=environment,
         ),
     )
+    mark_runtime_worker_ready(app.state, environment, message="Runtime worker refreshed after settings update.")
     return {
         "saved": True,
         "settings": serialize_settings(current_settings, environment_info=environment),
@@ -294,6 +314,7 @@ def install_local_asr(reinstall: bool = False) -> dict[str, object]:
             environment_info=environment,
         ),
     )
+    mark_runtime_worker_ready(app.state, environment, message="Runtime worker refreshed after ASR install.")
     write_runtime_metadata(
         runtime_channel,
         {
@@ -358,6 +379,7 @@ def install_knowledge_dependencies(reinstall: bool = False) -> dict[str, object]
             environment_info=environment,
         ),
     )
+    mark_runtime_worker_ready(app.state, environment, message="Runtime worker refreshed after knowledge install.")
     write_runtime_metadata(
         runtime_channel,
         {
@@ -429,7 +451,6 @@ def get_task_mindmap(task_id: str) -> TaskMindMapResponse:
 
 def generate_task_mindmap(task_id: str, force: bool = False) -> TaskMindMapResponse:
     task_store: SqliteTaskRepository = app.state.task_repository
-    task_worker = app.state.task_worker
     record = task_store.get_task(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -468,7 +489,7 @@ def generate_task_mindmap(task_id: str, force: bool = False) -> TaskMindMapRespo
         }
     )
     task_store.save_result(task_id, generating_result)
-    task_worker.submit_mindmap(task_id, force=force)
+    submit_mindmap_or_queue(app.state, task_store, task_id, force=force)
     refreshed = task_store.get_task(task_id)
     refreshed_result = refreshed.result if refreshed is not None else generating_result
     return TaskMindMapResponse(
@@ -477,4 +498,77 @@ def generate_task_mindmap(task_id: str, force: bool = False) -> TaskMindMapRespo
         error_message=refreshed_result.mindmap_error_message,
         updated_at=refreshed_result.mindmap_updated_at,
         mindmap=None,
+    )
+
+
+def get_task_visual_evidence(task_id: str) -> TaskVisualEvidenceResponse:
+    task_store: SqliteTaskRepository = app.state.task_repository
+    record = task_store.get_task(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    result = record.result
+    if result is None:
+        return TaskVisualEvidenceResponse(task_id=task_id, status="idle")
+
+    context_path = result.artifacts.get("visual_context_path")
+    context = load_visual_context(context_path) if context_path else None
+    note_path = result.visual_enhanced_note_artifact_path or result.visual_note_artifact_path or result.artifacts.get("visual_enhanced_note_path") or result.artifacts.get("visual_note_path")
+    return TaskVisualEvidenceResponse(
+        task_id=task_id,
+        mode=str(context.get("mode") if context else "text"),
+        status=result.visual_note_status or (str(context.get("status")) if context else "idle"),
+        error_message=result.visual_note_error_message,
+        updated_at=result.visual_note_updated_at,
+        frame_count=result.visual_frame_count,
+        insert_count=int(context.get("insert_count") or 0) if context else 0,
+        visual_note_markdown=load_visual_note_markdown(note_path),
+        enhanced_note_markdown=load_visual_note_markdown(note_path),
+        context=context,
+    )
+
+
+def generate_task_visual_evidence(task_id: str, force: bool = False, mode: str | None = None) -> TaskVisualEvidenceResponse:
+    task_store: SqliteTaskRepository = app.state.task_repository
+    record = task_store.get_task(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    if record.status != TaskStatus.COMPLETED or record.result is None:
+        raise HTTPException(status_code=400, detail="仅已完成且有结果的任务可以生成图文笔记。")
+
+    requested_mode = normalize_visual_note_mode(mode or settings_manager.current.visual_note_mode or "frame_insert", default="frame_insert")
+    if requested_mode == "text":
+        requested_mode = "frame_insert"
+    existing_path = record.result.visual_enhanced_note_artifact_path or record.result.visual_note_artifact_path or record.result.artifacts.get("visual_enhanced_note_path") or record.result.artifacts.get("visual_note_path")
+    if record.result.visual_note_status == "generating" and not force:
+        return TaskVisualEvidenceResponse(
+            task_id=task_id,
+            mode=requested_mode,
+            status="generating",
+            error_message=None,
+            updated_at=record.result.visual_note_updated_at,
+            frame_count=record.result.visual_frame_count,
+        )
+    if existing_path and record.result.visual_note_status == "ready" and not force:
+        return get_task_visual_evidence(task_id)
+
+    generating_result = record.result.model_copy(
+        update={
+            "visual_note_status": "generating",
+            "visual_note_error_message": None,
+        }
+    )
+    task_store.save_result(task_id, generating_result)
+    worker = getattr(app.state, "task_worker", None)
+    if worker is None or not hasattr(worker, "submit_visual_evidence"):
+        raise HTTPException(status_code=503, detail="图文笔记后台队列暂不可用。")
+    worker.submit_visual_evidence(task_id, force=force, mode=requested_mode)
+    refreshed = task_store.get_task(task_id)
+    refreshed_result = refreshed.result if refreshed is not None and refreshed.result is not None else generating_result
+    return TaskVisualEvidenceResponse(
+        task_id=task_id,
+        mode=requested_mode,
+        status=refreshed_result.visual_note_status,
+        error_message=refreshed_result.visual_note_error_message,
+        updated_at=refreshed_result.visual_note_updated_at,
+        frame_count=refreshed_result.visual_frame_count,
     )

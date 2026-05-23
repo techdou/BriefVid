@@ -4,6 +4,8 @@ import path from "node:path";
 
 const root = __dirname;
 const backendStaticRoot = path.resolve(root, "../web/static");
+const accessToken = process.env.VIDEO_SUM_ACCESS_TOKEN || "";
+const proxyHeaders = accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined;
 
 export default defineConfig(({ command }) => ({
   root,
@@ -17,9 +19,15 @@ export default defineConfig(({ command }) => ({
       allow: [root, path.resolve(root, "..")],
     },
     proxy: {
-      "/api": "http://127.0.0.1:3838",
+      "/api": {
+        target: "http://127.0.0.1:3838",
+        headers: proxyHeaders,
+      },
       "/health": "http://127.0.0.1:3838",
-      "/media": "http://127.0.0.1:3838",
+      "/media": {
+        target: "http://127.0.0.1:3838",
+        headers: proxyHeaders,
+      },
       "/static/assets/icons": "http://127.0.0.1:3838",
       "/static/favicon.ico": "http://127.0.0.1:3838",
       "/static/favicon.svg": "http://127.0.0.1:3838",

@@ -1,4 +1,5 @@
-import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { type FocusEvent, type FormEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import QRCode from "qrcode";
 
 import {
   DesktopState,
@@ -15,10 +16,14 @@ import {
   taskStatusClass,
 } from "../appModel";
 import { api } from "../api";
+import { SearchIcon } from "../components/AppIcons";
 import { FloatingNoticeStack } from "../components/FloatingNoticeStack";
-import type { EnvironmentInfo, RuntimeStatus, ServiceSettings, StorageLocationKind, StorageDirectoryStat, StorageOverview, TaskSummary } from "../types";
+import type { EnvironmentInfo, PromptPreset, PromptPresetCreateRequest, RuntimeStatus, ServiceSettings, StorageLocationKind, StorageDirectoryStat, StorageOverview, TaskSummary } from "../types";
+
 import { formatDateTime, taskStatusLabel } from "../utils";
 import { settingsCategories, type SettingsCategory } from "./settingsConfig";
+
+const HIDDEN_PROMPT_PRESETS_STORAGE_KEY = "bilisum.hiddenPromptPresetIds";
 
 function SiliconFlowApiKeyHelp() {
   return (
@@ -52,10 +57,30 @@ function SiliconFlowApiKeyHelp() {
   );
 }
 
+function loadHiddenPromptPresetIds() {
+  if (typeof window === "undefined") {
+    return new Set<string>();
+  }
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(HIDDEN_PROMPT_PRESETS_STORAGE_KEY) || "[]") as unknown;
+    return new Set(Array.isArray(parsed) ? parsed.map((item) => String(item)).filter(Boolean) : []);
+  } catch {
+    return new Set<string>();
+  }
+}
+
+function persistHiddenPromptPresetIds(ids: Set<string>) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.setItem(HIDDEN_PROMPT_PRESETS_STORAGE_KEY, JSON.stringify(Array.from(ids)));
+  window.dispatchEvent(new Event("bilisum:prompt-presets-visibility-changed"));
+}
 type SettingsPageProps = {
   snapshot: Snapshot;
   desktop: DesktopState;
   focusIssueRequest?: { issueKey: string; nonce: number } | null;
+  promptPresetRequest?: { presetId: string; nonce: number } | null;
   onRefresh(): void;
   onSettingsSaved(settings: ServiceSettings, environment: EnvironmentInfo | null): void;
   updateInfo: UpdateState;
@@ -65,9 +90,127 @@ type SettingsPageProps = {
   onDownloadUpdate(): Promise<unknown>;
   onInstallUpdate(): Promise<void>;
   onOpenUpdateDialog(): void;
+  onOpenSetupAssistant(): void;
 };
 
 const TASK_LIST_LIMIT = 60;
+type GenerationModelDialog = "main" | "visual" | null;
+type GenerationModelScope = Exclude<GenerationModelDialog, null>;
+type ModelAvailabilityStatus = "unknown" | "checking" | "available" | "unavailable";
+
+type ModelAvailabilityState = {
+  status: ModelAvailabilityStatus;
+  message: string;
+};
+
+type SettingsSearchItem = {
+  category: SettingsCategory;
+  targetKey: string;
+  title: string;
+  description: string;
+  keywords: string[];
+};
+
+type BilibiliCookieCaptureResult = {
+  cookiesFile: string;
+  cookieCount: number;
+  browser?: string;
+};
+
+const MASKED_API_KEY = "******";
+
+function isMaskedApiKey(value: string | undefined | null) {
+  return String(value || "").trim() === MASKED_API_KEY;
+}
+
+function hasUsableApiKey(value: string | undefined | null, configured: boolean | undefined) {
+  const trimmed = String(value || "").trim();
+  return Boolean(configured || (trimmed && !isMaskedApiKey(trimmed)));
+}
+
+function maskConfiguredApiKeys(settings: ServiceSettings | null): ServiceSettings | null {
+  if (!settings) {
+    return settings;
+  }
+  return {
+    ...settings,
+    siliconflow_asr_api_key: settings.siliconflow_asr_api_key_configured ? MASKED_API_KEY : settings.siliconflow_asr_api_key,
+    multimodal_asr_api_key: settings.multimodal_asr_api_key_configured ? MASKED_API_KEY : settings.multimodal_asr_api_key,
+    llm_api_key: settings.llm_api_key_configured ? MASKED_API_KEY : settings.llm_api_key,
+    knowledge_llm_api_key: settings.knowledge_llm_api_key_configured ? MASKED_API_KEY : settings.knowledge_llm_api_key,
+    visual_evidence_api_key: settings.visual_evidence_api_key_configured ? MASKED_API_KEY : settings.visual_evidence_api_key,
+  };
+}
+
+function selectMaskedApiKey(event: FocusEvent<HTMLInputElement>) {
+  if (isMaskedApiKey(event.currentTarget.value)) {
+    event.currentTarget.select();
+  }
+}
+
+const SETTINGS_SEARCH_ITEMS: SettingsSearchItem[] = [
+  { category: "maintenance", targetKey: "host", title: "监听地址", description: "服务绑定的 IP 地址。", keywords: ["host", "ip", "地址", "服务入口"] },
+  { category: "maintenance", targetKey: "port", title: "监听端口", description: "后端服务端口号。", keywords: ["port", "端口", "3838"] },
+  { category: "files", targetKey: "data_dir", title: "数据目录", description: "视频摘要和元数据保存位置。", keywords: ["data", "目录", "存储", "数据库"] },
+  { category: "files", targetKey: "cache_dir", title: "缓存目录", description: "临时缓存文件保存位置。", keywords: ["cache", "缓存", "临时文件"] },
+  { category: "files", targetKey: "tasks_dir", title: "任务目录", description: "任务历史和结果文件位置。", keywords: ["task", "tasks", "任务", "历史"] },
+  { category: "files", targetKey: "output_dir", title: "输出目录", description: "Markdown / Obsidian 导出目录。", keywords: ["output", "导出", "obsidian", "markdown", "笔记"] },
+  { category: "files", targetKey: "storage_cleanup", title: "空间清理", description: "查看占用并清理缓存和孤儿任务。", keywords: ["清理", "空间", "缓存", "孤儿", "storage"] },
+  { category: "transcription", targetKey: "transcription_provider", title: "转写方式", description: "选择云端 ASR 或本地 ASR。", keywords: ["asr", "转写", "语音识别", "whisper", "本地"] },
+  { category: "transcription", targetKey: "siliconflow_asr_base_url", title: "SiliconFlow Base URL", description: "云端转写 API 地址。", keywords: ["siliconflow", "base url", "api", "硅基流动"] },
+  { category: "transcription", targetKey: "siliconflow_asr_api_key", title: "SiliconFlow API Key", description: "云端转写 API 密钥。", keywords: ["key", "apikey", "api key", "密钥", "硅基流动"] },
+  { category: "transcription", targetKey: "siliconflow_asr_model", title: "ASR 模型", description: "云端转写模型名称。", keywords: ["model", "模型", "teleai", "telespeechasr"] },
+  { category: "transcription", targetKey: "siliconflow_asr_chunk_duration_seconds", title: "硅基 ASR 切片时长（秒）", description: "长音频自动切片的每段秒数，默认 1800（30 分钟）。", keywords: ["siliconflow", "切片", "chunk", "分段", "秒"] },
+  { category: "transcription", targetKey: "siliconflow_asr_concurrency", title: "硅基 ASR 并发数", description: "同时发送的转写请求数。", keywords: ["siliconflow", "并发", "concurrency"] },
+  { category: "transcription", targetKey: "multimodal_asr_base_url", title: "多模态 ASR Base URL", description: "多模态转写 API 地址。", keywords: ["multimodal", "多模态", "base url", "api"] },
+  { category: "transcription", targetKey: "multimodal_asr_api_key", title: "多模态 ASR API Key", description: "多模态转写 API 密钥。", keywords: ["multimodal", "多模态", "key", "apikey", "api key", "密钥"] },
+  { category: "transcription", targetKey: "multimodal_asr_model", title: "多模态 ASR 模型", description: "多模态转写模型名称。", keywords: ["multimodal", "多模态", "model", "模型", "mimo"] },
+  { category: "transcription", targetKey: "multimodal_asr_chunk_duration_seconds", title: "多模态切片时长（秒）", description: "长音频自动切片的每段秒数。", keywords: ["multimodal", "切片", "chunk", "分段", "秒"] },
+  { category: "transcription", targetKey: "multimodal_asr_max_retries", title: "多模态切片重试次数", description: "每段切片返回空时的重试上限。", keywords: ["multimodal", "重试", "retry", "次数"] },
+  { category: "transcription", targetKey: "device_preference", title: "推理设备", description: "本地 ASR 使用 CPU 或 CUDA。", keywords: ["cuda", "gpu", "cpu", "设备"] },
+  { category: "transcription", targetKey: "fixed_model", title: "Whisper 固定模型", description: "本地 Whisper 模型大小。", keywords: ["whisper", "tiny", "base", "small", "medium", "large"] },
+  { category: "generation", targetKey: "llm_enabled", title: "启用 LLM 摘要", description: "打开或关闭大模型摘要。", keywords: ["llm", "摘要", "开启", "关闭"] },
+  { category: "generation", targetKey: "auto_generate_mindmap", title: "自动生成思维导图", description: "摘要完成后自动生成导图。", keywords: ["导图", "mindmap", "自动", "思维导图"] },
+  { category: "generation", targetKey: "prompt_router_mode", title: "Prompt 路由模式", description: "选择自动套用推荐 Prompt，或每次确认后使用。", keywords: ["prompt", "提示词", "路由", "自动", "确认"] },
+  { category: "generation", targetKey: "visual_note_mode", title: "图文笔记形式", description: "选择纯文本、插图笔记或 VLM 理解型图文笔记。", keywords: ["视觉", "图片", "截图", "图文笔记", "vlm"] },
+  { category: "generation", targetKey: "visual_download_resolution", title: "图文视频分辨率", description: "图文笔记专用视频下载清晰度。", keywords: ["图文", "分辨率", "下载", "截图"] },
+  { category: "generation", targetKey: "visual_multimodal_enabled", title: "多模态理解", description: "是否调用 VLM 理解截图。", keywords: ["vlm", "多模态", "视觉", "图片理解"] },
+  { category: "generation", targetKey: "llm_base_url", title: "LLM API Base URL", description: "主摘要 LLM API 地址。", keywords: ["base url", "openai", "compatible", "api", "地址"] },
+  { category: "generation", targetKey: "llm_api_key", title: "LLM API Key", description: "主摘要 LLM API 密钥。", keywords: ["key", "apikey", "api key", "密钥"] },
+  { category: "generation", targetKey: "llm_model", title: "LLM 模型名称", description: "主摘要使用的模型名。", keywords: ["model", "模型", "gpt", "qwen", "mimo", "claude"] },
+  { category: "knowledge", targetKey: "knowledge_enabled", title: "启用知识库", description: "开启知识库索引和问答能力。", keywords: ["知识库", "knowledge", "rag", "索引", "问答"] },
+  { category: "knowledge", targetKey: "knowledge_dependencies", title: "知识库依赖", description: "安装和检查知识库扩展依赖。", keywords: ["依赖", "安装", "runtime", "faiss", "向量"] },
+  { category: "knowledge", targetKey: "knowledge_llm_mode", title: "知识库 LLM 来源", description: "跟随主 LLM 或使用独立配置。", keywords: ["知识库", "llm", "来源", "独立配置"] },
+  { category: "knowledge", targetKey: "knowledge_llm_provider", title: "知识库 LLM 提供商", description: "独立知识库 LLM 服务类型。", keywords: ["知识库", "provider", "openai", "anthropic", "提供商"] },
+  { category: "knowledge", targetKey: "knowledge_llm_base_url", title: "知识库 API Base URL", description: "独立知识库 LLM API 地址。", keywords: ["知识库", "base url", "api", "openai"] },
+  { category: "knowledge", targetKey: "knowledge_llm_api_key", title: "知识库 API Key", description: "独立知识库 LLM API 密钥。", keywords: ["知识库", "key", "apikey", "密钥"] },
+  { category: "knowledge", targetKey: "knowledge_llm_model", title: "知识库模型名称", description: "独立知识库 LLM 模型名。", keywords: ["知识库", "model", "模型", "问答"] },
+  { category: "generation", targetKey: "summary_mode", title: "摘要模式", description: "LLM 智能摘要或抽取式摘要。", keywords: ["摘要", "summary", "抽取式", "llm"] },
+  { category: "generation", targetKey: "language", title: "语言", description: "摘要输出语言。", keywords: ["语言", "中文", "english", "日本語"] },
+  { category: "generation", targetKey: "summary_chunk_target_chars", title: "分块目标字符数", description: "LLM 分块处理的目标长度。", keywords: ["分块", "chunk", "字符", "长度"] },
+  { category: "generation", targetKey: "summary_chunk_overlap_segments", title: "分块重叠段数", description: "摘要分块之间保留的重叠段落。", keywords: ["重叠", "overlap", "分块"] },
+  { category: "generation", targetKey: "summary_chunk_retry_count", title: "重试次数", description: "摘要 API 失败后的重试次数。", keywords: ["重试", "retry", "失败"] },
+  { category: "prompts", targetKey: "summary_system_prompt", title: "摘要 System Prompt", description: "控制视频摘要生成的角色、风格和整体约束。", keywords: ["摘要", "prompt", "system", "提示词", "风格"] },
+  { category: "prompts", targetKey: "summary_user_prompt_template", title: "摘要 User Template", description: "控制摘要变量、结构和输出格式。", keywords: ["摘要", "template", "模板", "格式", "transcript"] },
+  { category: "prompts", targetKey: "knowledge_note_system_prompt", title: "知识笔记 System Prompt", description: "控制知识笔记角色、风格和整体约束。", keywords: ["知识笔记", "prompt", "system", "提示词", "风格"] },
+  { category: "prompts", targetKey: "knowledge_note_user_prompt_template", title: "知识笔记 User Template", description: "控制知识笔记变量、结构和 Markdown 格式。", keywords: ["知识笔记", "template", "模板", "格式", "summary_json", "transcript"] },
+  { category: "prompts", targetKey: "visual_note_system_prompt", title: "图文笔记 System Prompt", description: "控制 VLM 图文笔记整合风格。", keywords: ["图文笔记", "prompt", "vlm", "图片"] },
+  { category: "prompts", targetKey: "visual_note_user_prompt_template", title: "图文笔记 User Template", description: "控制图文笔记变量、结构和格式。", keywords: ["图文笔记", "template", "模板", "格式", "prompt"] },
+  { category: "prompts", targetKey: "visual_frame_planning_prompt", title: "捕获帧规划 Prompt", description: "控制如何判断哪些时间点值得截图。", keywords: ["截图", "规划", "关键帧", "prompt"] },
+  { category: "prompts", targetKey: "visual_vlm_prompt", title: "画面理解 Prompt", description: "控制 VLM 如何解析截图。", keywords: ["vlm", "画面理解", "ocr", "prompt"] },
+  { category: "performance", targetKey: "task_concurrency", title: "任务并发数", description: "控制整体任务吞吐。", keywords: ["并发", "concurrency", "任务", "性能"] },
+  { category: "performance", targetKey: "mindmap_concurrency", title: "导图并发数", description: "控制导图生成并发。", keywords: ["导图", "并发", "mindmap"] },
+  { category: "performance", targetKey: "summary_chunk_concurrency", title: "摘要分块并发数", description: "控制单任务内部摘要请求并发。", keywords: ["摘要", "分块", "并发", "chunk"] },
+  { category: "performance", targetKey: "cuda_variant", title: "CUDA 变体", description: "选择 PyTorch CUDA 版本。", keywords: ["cuda", "cu128", "cu126", "cu124", "gpu"] },
+  { category: "performance", targetKey: "runtime_channel", title: "运行环境通道", description: "选择基础版或 GPU 运行环境。", keywords: ["runtime", "运行环境", "gpu", "base"] },
+  { category: "video", targetKey: "preserve_temp_audio", title: "保留临时音频", description: "控制是否保留转写中间音频。", keywords: ["音频", "临时", "preserve", "temp"] },
+  { category: "video", targetKey: "enable_cache", title: "启用缓存", description: "控制任务缓存行为。", keywords: ["缓存", "cache"] },
+  { category: "video", targetKey: "ytdlp_cookies_file", title: "yt-dlp Cookies 文件", description: "配置 B 站登录态 cookies.txt。", keywords: ["cookie", "cookies", "b站", "登录", "风控", "412"] },
+  { category: "runtime", targetKey: "runtime_status", title: "运行环境状态", description: "检查 Python、Torch、CUDA 与扩展依赖。", keywords: ["运行环境", "环境", "torch", "python", "cuda"] },
+  { category: "runtime", targetKey: "local_asr_runtime", title: "本地 ASR 运行环境", description: "安装或检查本地 ASR 依赖。", keywords: ["本地", "asr", "whisper", "安装"] },
+  { category: "logs", targetKey: "service_logs", title: "服务日志", description: "查看后端服务日志。", keywords: ["日志", "log", "报错", "服务"] },
+  { category: "updates", targetKey: "app_updates", title: "应用更新", description: "检查桌面应用新版本。", keywords: ["更新", "版本", "update", "release"] },
+];
 
 function formatStorageSize(sizeBytes: number) {
   if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
@@ -95,6 +238,7 @@ export function SettingsPage({
   snapshot,
   desktop,
   focusIssueRequest,
+  promptPresetRequest,
   onRefresh,
   onSettingsSaved,
   updateInfo,
@@ -104,8 +248,9 @@ export function SettingsPage({
   onDownloadUpdate,
   onInstallUpdate,
   onOpenUpdateDialog,
+  onOpenSetupAssistant,
 }: SettingsPageProps) {
-  const [form, setForm] = useState<ServiceSettings | null>(snapshot.settings);
+  const [form, setForm] = useState<ServiceSettings | null>(() => maskConfiguredApiKeys(snapshot.settings));
   const [environment, setEnvironment] = useState<EnvironmentInfo | null>(snapshot.environment);
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -120,6 +265,10 @@ export function SettingsPage({
   const [localAsrStatus, setLocalAsrStatus] = useState("");
   const [localAsrOutput, setLocalAsrOutput] = useState("");
   const [localAsrInstalling, setLocalAsrInstalling] = useState(false);
+  const [bilibiliCookieCapturing, setBilibiliCookieCapturing] = useState(false);
+  const [bilibiliCookieStatus, setBilibiliCookieStatus] = useState("");
+  const [bilibiliQrcodeKey, setBilibiliQrcodeKey] = useState("");
+  const [bilibiliQrcodeImage, setBilibiliQrcodeImage] = useState("");
   const [knowledgeDepsStatus, setKnowledgeDepsStatus] = useState("");
   const [knowledgeDepsOutput, setKnowledgeDepsOutput] = useState("");
   const [knowledgeDepsInstalling, setKnowledgeDepsInstalling] = useState(false);
@@ -133,7 +282,12 @@ export function SettingsPage({
   const [asrTestStatus, setAsrTestStatus] = useState("");
   const [asrTestBusy, setAsrTestBusy] = useState(false);
   const [llmTestStatus, setLlmTestStatus] = useState("");
+  const [llmTestNoticeVersion, setLlmTestNoticeVersion] = useState(0);
   const [llmTestBusy, setLlmTestBusy] = useState(false);
+  const [modelAvailability, setModelAvailability] = useState<Record<GenerationModelScope, ModelAvailabilityState>>({
+    main: { status: "unknown", message: "" },
+    visual: { status: "unknown", message: "" },
+  });
   const [storageOverview, setStorageOverview] = useState<StorageOverview | null>(null);
   const [storageLoading, setStorageLoading] = useState(false);
   const [storageCleaning, setStorageCleaning] = useState(false);
@@ -141,18 +295,330 @@ export function SettingsPage({
   const [activeCategory, setActiveCategory] = useState<SettingsCategory>("overview");
   const [pendingFocusTarget, setPendingFocusTarget] = useState<string | null>(null);
   const [activeFocusTarget, setActiveFocusTarget] = useState<string | null>(null);
+  const [knowledgePromptGuideOpen, setKnowledgePromptGuideOpen] = useState(false);
+  const [generationModelDialog, setGenerationModelDialog] = useState<GenerationModelDialog>(null);
+  const [settingsSearchQuery, setSettingsSearchQuery] = useState("");
   const [taskListOpen, setTaskListOpen] = useState(false);
   const [taskListLoading, setTaskListLoading] = useState(false);
   const [taskListError, setTaskListError] = useState("");
   const [taskList, setTaskList] = useState<TaskSummary[]>([]);
+  const settingsNavRef = useRef<HTMLElement | null>(null);
+  const settingsContentScrollRef = useRef<HTMLDivElement | null>(null);
+  const promptDetailsRefs = useRef<Record<string, HTMLDetailsElement | null>>({});
   const focusTargetRefs = useRef<Record<string, HTMLElement | null>>({});
   const lastHandledExternalFocusNonce = useRef<number | null>(null);
+  const lastHandledPromptPresetNonce = useRef<number | null>(null);
+  const silentModelCheckRunId = useRef(0);
+  const [promptPresets, setPromptPresets] = useState<PromptPreset[]>([]);
+  const [hiddenPromptPresetIds, setHiddenPromptPresetIds] = useState<Set<string>>(() => loadHiddenPromptPresetIds());
+  const [promptPresetsLoading, setPromptPresetsLoading] = useState(false);
+  const [expandedPresetIds, setExpandedPresetIds] = useState<Set<string>>(new Set());
+  const [showNewPresetForm, setShowNewPresetForm] = useState(false);
+  const [presetForm, setPresetForm] = useState<PromptPresetCreateRequest>(() => emptyPresetForm());
+  const [presetSaveBusy, setPresetSaveBusy] = useState(false);
+  const [presetStatus, setPresetStatus] = useState("");
+  const [presetDeleteConfirm, setPresetDeleteConfirm] = useState<string | null>(null);
+  const [presetsSectionOpen, setPresetsSectionOpen] = useState(false);
+  const [undoPromptValues, setUndoPromptValues] = useState<Record<string, string> | null>(null);
+
+  function emptyPresetForm(): PromptPresetCreateRequest {
+    return { name: "", system_prompt: "", user_prompt_template: "", description: "", category: "", auto_match_keywords: [] };
+  }
+
+  function loadPromptPresets() {
+    setPromptPresetsLoading(true);
+    api.listPromptPresets().then((list) => setPromptPresets(list)).catch(() => {}).finally(() => setPromptPresetsLoading(false));
+  }
+
+  function togglePreset(presetId: string, preset: PromptPreset) {
+    setExpandedPresetIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(presetId)) {
+        next.delete(presetId);
+      } else {
+        next.add(presetId);
+        setPresetForm({
+          name: preset.name,
+          system_prompt: preset.system_prompt,
+          user_prompt_template: preset.user_prompt_template,
+          description: preset.description || "",
+          category: preset.category || "",
+          auto_match_keywords: preset.auto_match_keywords || [],
+        });
+        setShowNewPresetForm(false);
+        setPresetStatus("");
+        setPresetDeleteConfirm(null);
+      }
+      return next;
+    });
+  }
+
+  function startNewPreset() {
+    setPresetForm(emptyPresetForm());
+    setShowNewPresetForm(true);
+    setPresetStatus("");
+  }
+
+  function cancelPresetEdit() {
+    setExpandedPresetIds(new Set());
+    setShowNewPresetForm(false);
+    setPresetForm(emptyPresetForm());
+    setPresetStatus("");
+    setPresetDeleteConfirm(null);
+  }
+
+  function closeOnePreset(presetId: string) {
+    setExpandedPresetIds((prev) => {
+      const next = new Set(prev);
+      next.delete(presetId);
+      return next;
+    });
+  }
+
+  function openPromptPresetInSettings(presetId: string) {
+    const targetPreset = promptPresets.find((preset) => preset.id === presetId);
+    setActiveCategory("prompts");
+    setPresetsSectionOpen(true);
+    setShowNewPresetForm(false);
+    setPresetDeleteConfirm(null);
+    setSettingsSearchQuery("");
+    setPresetStatus(targetPreset ? `已定位到「${targetPreset.name}」` : "已打开 Prompt 预设库");
+    if (targetPreset) {
+      setExpandedPresetIds(new Set([targetPreset.id]));
+      setPresetForm({
+        name: targetPreset.name,
+        system_prompt: targetPreset.system_prompt,
+        user_prompt_template: targetPreset.user_prompt_template,
+        description: targetPreset.description || "",
+        category: targetPreset.category || "",
+        auto_match_keywords: targetPreset.auto_match_keywords || [],
+      });
+    }
+    window.setTimeout(() => {
+      focusTargetRefs.current.prompt_presets_library?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 80);
+  }
+
+  function savePreset() {
+    if (!presetForm.name.trim() || !presetForm.system_prompt.trim() || !presetForm.user_prompt_template.trim()) return;
+    setPresetSaveBusy(true);
+    setPresetStatus("保存中...");
+    api.createPromptPreset(presetForm).then(() => {
+      setPresetStatus("保存成功");
+      setShowNewPresetForm(false);
+      setExpandedPresetIds(new Set());
+      loadPromptPresets();
+    }).catch((err) => {
+      setPresetStatus("保存失败: " + (err?.message || String(err)));
+    }).finally(() => setPresetSaveBusy(false));
+  }
+
+  function deletePreset(presetId: string) {
+    setPresetSaveBusy(true);
+    setPresetStatus("删除中...");
+    api.deletePromptPreset(presetId).then(() => {
+      setPresetStatus("删除成功");
+      setPresetDeleteConfirm(null);
+      setExpandedPresetIds(new Set());
+      setShowNewPresetForm(false);
+      loadPromptPresets();
+    }).catch((err) => {
+      setPresetStatus("删除失败: " + (err?.message || String(err)));
+    }).finally(() => setPresetSaveBusy(false));
+  }
+
+  function collapseAllPrompts() {
+    setExpandedPresetIds(new Set());
+    setShowNewPresetForm(false);
+    setPresetDeleteConfirm(null);
+  }
+
+  function collapseAllAndCloseSection() {
+    collapseAllPrompts();
+    setPresetsSectionOpen(false);
+  }
+
+  const builtinPresetCount = promptPresets.filter((p) => p.is_builtin).length;
+  const hiddenBuiltinPresetCount = promptPresets.filter((p) => p.is_builtin && hiddenPromptPresetIds.has(p.id)).length;
+  const customPresetCount = promptPresets.length - builtinPresetCount;
+  const visiblePresets = promptPresets.filter((p) => !p.is_builtin || !hiddenPromptPresetIds.has(p.id));
+  const hiddenBuiltinPresets = promptPresets.filter((p) => p.is_builtin && hiddenPromptPresetIds.has(p.id));
+
+
+  function setBuiltinPresetHidden(presetId: string, hidden: boolean) {
+    setHiddenPromptPresetIds((prev) => {
+      const next = new Set(prev);
+      if (hidden) {
+        next.add(presetId);
+        closeOnePreset(presetId);
+      } else {
+        next.delete(presetId);
+      }
+      persistHiddenPromptPresetIds(next);
+      return next;
+    });
+  }
+
+  function renderPresetCard(preset: PromptPreset) {
+    const isExpanded = expandedPresetIds.has(preset.id);
+    return (
+      <div key={preset.id} className={`settings-preset-card${preset.is_builtin ? " builtin" : ""}`}>
+        <div className="settings-preset-card-header" onClick={() => togglePreset(preset.id, preset)}>
+          <span className="settings-preset-name">
+            {preset.name}
+            {preset.is_builtin && <span className="settings-preset-badge builtin">内置</span>}
+          </span>
+          <span className="settings-preset-meta">
+            {preset.category && <span className="settings-preset-category">{preset.category}</span>}
+            <span className="settings-preset-keywords">{preset.auto_match_keywords?.join("、") || "无匹配关键词"}</span>
+          </span>
+          <span className="settings-preset-expand-hint">{isExpanded ? "收起" : preset.is_builtin ? "查看内容" : "编辑"}</span>
+          {preset.is_builtin && (
+            <button
+              className="settings-preset-hide-button"
+              type="button"
+              onClick={(event) => { event.stopPropagation(); setBuiltinPresetHidden(preset.id, true); }}
+            >
+              隐藏
+            </button>
+          )}
+        </div>
+        {(isExpanded && !preset.is_builtin) && (
+          <div className="settings-preset-edit-body">
+            {presetDeleteConfirm === preset.id ? (
+              <div className="settings-preset-delete-confirm">
+                <strong>确定删除「{preset.name}」？</strong>
+                <button className="secondary-button" type="button" onClick={() => setPresetDeleteConfirm(null)}>取消</button>
+                <button className="primary-button danger" type="button" disabled={presetSaveBusy} onClick={() => deletePreset(preset.id)}>
+                  {presetSaveBusy ? "删除中..." : "确认删除"}
+                </button>
+              </div>
+            ) : (
+              <>
+                <label className="settings-input-group settings-preset-field">
+                  <span className="settings-input-label">名称</span>
+                  <input className="settings-input-field" value={presetForm.name} onChange={(e) => setPresetForm({ ...presetForm, name: e.target.value })} />
+                </label>
+                <label className="settings-input-group settings-preset-field">
+                  <span className="settings-input-label">描述</span>
+                  <input className="settings-input-field" value={presetForm.description || ""} onChange={(e) => setPresetForm({ ...presetForm, description: e.target.value })} />
+                </label>
+                <label className="settings-input-group settings-preset-field">
+                  <span className="settings-input-label">分类</span>
+                  <input className="settings-input-field" value={presetForm.category || ""} onChange={(e) => setPresetForm({ ...presetForm, category: e.target.value })} placeholder="例如: 教程、会议、娱乐" />
+                </label>
+                <label className="settings-input-group settings-preset-field">
+                  <span className="settings-input-label">自动匹配关键词（逗号分隔）</span>
+                  <input className="settings-input-field" value={presetForm.auto_match_keywords?.join("、") || ""} onChange={(e) => setPresetForm({ ...presetForm, auto_match_keywords: e.target.value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean) })} placeholder="例如: 教程、教学、入门、实操" />
+                </label>
+                <label className="settings-input-group settings-preset-field">
+                  <span className="settings-input-label">System Prompt</span>
+                  <textarea className="textarea-field" rows={4} value={presetForm.system_prompt} onChange={(e) => setPresetForm({ ...presetForm, system_prompt: e.target.value })} />
+                </label>
+                <label className="settings-input-group settings-preset-field">
+                  <span className="settings-input-label">User Template</span>
+                  <textarea className="textarea-field" rows={10} value={presetForm.user_prompt_template} onChange={(e) => setPresetForm({ ...presetForm, user_prompt_template: e.target.value })} />
+                  <span className="settings-input-caption">可用变量：{"{title}"}、{"{transcript}"}、{"{segments_json}"}。</span>
+                </label>
+                <div className="settings-preset-actions">
+                  <button className="primary-button" type="button" disabled={presetSaveBusy} onClick={savePreset}>
+                    {presetSaveBusy ? "保存中..." : "保存修改"}
+                  </button>
+                  <button className="secondary-button" type="button" onClick={() => closeOnePreset(preset.id)}>收起</button>
+                  <button className="secondary-button danger" type="button" onClick={() => setPresetDeleteConfirm(preset.id)}>删除</button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        {(isExpanded && preset.is_builtin) && (
+          <div className="settings-preset-view-body">
+            <p className="settings-preset-desc">{preset.description || "（无描述）"}</p>
+            <pre className="settings-preset-preview"><strong>System:</strong>{"\n"}{preset.system_prompt}{"\n\n"}<strong>User Template:</strong>{"\n"}{preset.user_prompt_template}</pre>
+            <button className="secondary-button" type="button" onClick={() => closeOnePreset(preset.id)}>收起</button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Track outermost <details> open state for sticky header
+  const [outerSectionsOpen, setOuterSectionsOpen] = useState<Set<string>>(new Set());
+  const hasOuterSectionsOpen = outerSectionsOpen.size > 0;
+
+  function collapseAllOuter() {
+    Object.values(promptDetailsRefs.current).forEach((node) => {
+      if (node) {
+        node.open = false;
+      }
+    });
+    setOuterSectionsOpen(new Set());
+    setPresetsSectionOpen(false);
+    collapseAllPrompts();
+  }
+
+  function scrollSettingsToTop() {
+    const target = settingsContentScrollRef.current;
+    target?.scrollIntoView({ behavior: "smooth", block: "start" });
+    target?.scrollTo({ top: 0, behavior: "smooth" });
+    target?.closest(".settings-content")?.scrollTo({ top: 0, behavior: "smooth" });
+    document.querySelector(".app-main")?.scrollTo({ top: 0, behavior: "smooth" });
+    document.querySelector(".app-content")?.scrollTo({ top: 0, behavior: "smooth" });
+    document.scrollingElement?.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function handleOuterToggle(name: string, e: React.SyntheticEvent<HTMLDetailsElement>) {
+    const open = (e.target as HTMLDetailsElement).open;
+    setOuterSectionsOpen((prev) => {
+      const next = new Set(prev);
+      if (open) next.add(name);
+      else next.delete(name);
+      return next;
+    });
+  }
+
+  function handlePresetsSectionToggle() {
+    setPresetsSectionOpen((v) => {
+      const next = !v;
+      setOuterSectionsOpen((prev) => {
+        const n = new Set(prev);
+        if (next) n.add("presets");
+        else n.delete("presets");
+        return n;
+      });
+      return next;
+    });
+  }
+
+  useLayoutEffect(() => {
+    const node = settingsNavRef.current;
+    if (!node) {
+      return;
+    }
+
+    const updateStickyTop = () => {
+      const bottomGap = 24;
+      const topGap = 24;
+      const stickyTop = Math.min(topGap, window.innerHeight - node.offsetHeight - bottomGap);
+      node.style.setProperty("--settings-nav-sticky-top", `${Math.round(stickyTop)}px`);
+    };
+
+    updateStickyTop();
+    const observer = new ResizeObserver(updateStickyTop);
+    observer.observe(node);
+    window.addEventListener("resize", updateStickyTop);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateStickyTop);
+    };
+  }, []);
 
   useEffect(() => {
     if (isDirty) {
       return;
     }
-    setForm(snapshot.settings);
+    setForm(maskConfiguredApiKeys(snapshot.settings));
   }, [isDirty, snapshot.settings]);
 
   useEffect(() => {
@@ -174,6 +640,67 @@ export function SettingsPage({
     }, 30 * 60 * 1000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (activeCategory === "prompts") {
+      loadPromptPresets();
+    }
+  }, [activeCategory]);
+
+  useEffect(() => {
+    if (!bilibiliQrcodeKey) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const result = await api.pollBilibiliCookieQrcode(bilibiliQrcodeKey);
+          if (cancelled) {
+            return;
+          }
+          if (result.status === "pending") {
+            setBilibiliCookieStatus("等待手机 B 站扫码。");
+            return;
+          }
+          if (result.status === "scanned") {
+            setBilibiliCookieStatus("已扫码，请在手机 B 站上确认登录。");
+            return;
+          }
+          if (result.status === "expired") {
+            setBilibiliCookieStatus(result.message || "二维码已过期，请重新获取。");
+            setBilibiliQrcodeKey("");
+            setBilibiliQrcodeImage("");
+            return;
+          }
+          if (result.status === "confirmed" && result.cookiesFile) {
+            const response = await api.updateSettings({
+              ytdlp_cookies_file: result.cookiesFile,
+              ytdlp_cookies_browser: "",
+            });
+            if (cancelled) {
+              return;
+            }
+            setForm(maskConfiguredApiKeys(response.settings));
+            setIsDirty(false);
+            setSaveStatus(response.message || "设置已保存");
+            setBilibiliCookieStatus(`B 站登录态已保存，捕获 ${result.cookieCount || 0} 条 cookies。`);
+            setBilibiliQrcodeKey("");
+            setBilibiliQrcodeImage("");
+            onSettingsSaved(response.settings, environment);
+          }
+        } catch (error) {
+          if (!cancelled) {
+            setBilibiliCookieStatus(error instanceof Error ? error.message : "二维码登录状态检查失败。");
+          }
+        }
+      })();
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [bilibiliQrcodeKey, environment, onSettingsSaved]);
 
   async function refreshLogs() {
     try {
@@ -198,17 +725,17 @@ export function SettingsPage({
     try {
       setRuntimeStatusLoading(true);
       if (!options.silent) {
-        setRuntimeStatusMessage("正在检查所有运行时...");
+        setRuntimeStatusMessage("正在检查所有运行环境...");
       }
       const status = await api.getRuntimeStatus();
       setRuntimeStatus(status);
       const outdatedCount = status.channels.filter((channel) => channel.needsUpdate).length;
       if (!options.silent) {
-        setRuntimeStatusMessage(outdatedCount > 0 ? `${outdatedCount} 个运行时需要同步基础版本。` : "所有已安装运行时均为最新基础版本。");
+        setRuntimeStatusMessage(outdatedCount > 0 ? `${outdatedCount} 个运行环境需要同步基础版本。` : "所有已安装运行环境均为最新基础版本。");
       }
     } catch (error) {
       if (!options.silent) {
-        setRuntimeStatusMessage(error instanceof Error ? error.message : "运行时检查失败");
+        setRuntimeStatusMessage(error instanceof Error ? error.message : "运行环境检查失败");
       }
     } finally {
       setRuntimeStatusLoading(false);
@@ -221,7 +748,7 @@ export function SettingsPage({
     }
     try {
       setRuntimeSyncing(true);
-      setRuntimeStatusMessage("正在同步需要更新的运行时...");
+      setRuntimeStatusMessage("正在同步需要更新的运行环境...");
       const response = await api.syncRuntime();
       if (response.runtimeStatus) {
         setRuntimeStatus(response.runtimeStatus);
@@ -232,10 +759,10 @@ export function SettingsPage({
       setEnvironment(nextEnvironment);
       onSettingsSaved(form, nextEnvironment);
       const syncedCount = response.channels?.filter((channel) => channel.synced).length ?? 0;
-      setRuntimeStatusMessage(syncedCount > 0 ? `已同步 ${syncedCount} 个运行时，保留 CUDA / ASR / 知识库扩展包。` : "运行时已检查，无需同步。");
+      setRuntimeStatusMessage(syncedCount > 0 ? `已同步 ${syncedCount} 个运行环境，保留 CUDA / ASR / 知识库扩展包。` : "运行环境已检查，无需同步。");
       onRefresh();
     } catch (error) {
-      setRuntimeStatusMessage(error instanceof Error ? error.message : "运行时同步失败");
+      setRuntimeStatusMessage(error instanceof Error ? error.message : "运行环境同步失败");
     } finally {
       setRuntimeSyncing(false);
     }
@@ -257,12 +784,7 @@ export function SettingsPage({
           taskIds = undefined;
         }
       }
-      const overview = await window.desktop.fileManager.getStorageOverview({
-        dataDir: form.data_dir,
-        cacheDir: form.cache_dir,
-        tasksDir: form.tasks_dir,
-        taskIds,
-      });
+      const overview = await window.desktop.fileManager.getStorageOverview({ taskIds });
       setStorageOverview(overview);
       if (!taskIds) {
         setStorageStatus("服务离线：已展示本地占用情况，清理操作需要在服务在线时确认引用关系。");
@@ -272,17 +794,13 @@ export function SettingsPage({
     } finally {
       setStorageLoading(false);
     }
-  }, [form, form?.data_dir, form?.cache_dir, form?.tasks_dir, snapshot.serviceOnline]);
+  }, [form, snapshot.serviceOnline]);
 
   async function openManagedDirectory(kind: StorageLocationKind) {
     if (!form || !window.desktop?.fileManager) {
       return;
     }
-    await window.desktop.fileManager.openDirectory(kind, {
-      dataDir: form.data_dir,
-      cacheDir: form.cache_dir,
-      tasksDir: form.tasks_dir,
-    });
+    await window.desktop.fileManager.openDirectory(kind);
   }
 
   async function cleanupManagedFiles() {
@@ -293,12 +811,7 @@ export function SettingsPage({
       setStorageCleaning(true);
       setStorageStatus("");
       const taskIds = (await api.listTasks()).map((task) => task.task_id);
-      const preview = await window.desktop.fileManager.getStorageOverview({
-        dataDir: form.data_dir,
-        cacheDir: form.cache_dir,
-        tasksDir: form.tasks_dir,
-        taskIds,
-      });
+      const preview = await window.desktop.fileManager.getStorageOverview({ taskIds });
       const targetCount = preview.cleanup.orphanTaskCount + preview.cleanup.cacheCandidateCount;
       const targetBytes = preview.cleanup.orphanTaskBytes + preview.cleanup.cacheCandidateBytes;
       if (targetCount <= 0) {
@@ -314,11 +827,7 @@ export function SettingsPage({
         setStorageStatus("已取消清理。");
         return;
       }
-      const result = await window.desktop.fileManager.cleanupOrphans({
-        cacheDir: form.cache_dir,
-        tasksDir: form.tasks_dir,
-        taskIds,
-      });
+      const result = await window.desktop.fileManager.cleanupOrphans({ taskIds });
       await refreshStorageOverview();
       setStorageStatus(`已清理 ${result.deletedCount} 项内容，释放约 ${formatStorageSize(result.reclaimedBytes)}。`);
     } catch (error) {
@@ -347,19 +856,112 @@ export function SettingsPage({
   const effectiveLogPath = logPath || snapshot.systemInfo?.service?.log_file || desktop.logPath || "-";
   const targetRuntimeChannel = `gpu-${form?.cuda_variant || "cu128"}`;
   const activeCategoryMeta = settingsCategories.find((category) => category.id === activeCategory) || settingsCategories[0];
-  const workspaceCategories = settingsCategories.filter((category) => category.group === "workspace");
+  const workflowCategories = settingsCategories.filter((category) => category.group === "workflow");
   const systemCategories = settingsCategories.filter((category) => category.group === "system");
-  const llmReady = Boolean(form?.llm_enabled && form?.llm_api_key_configured);
+  const normalizedSettingsSearchQuery = settingsSearchQuery.trim().toLowerCase();
+  const settingsSearchTokens = normalizedSettingsSearchQuery.split(/\s+/).filter(Boolean);
+  const settingsSearchResults = normalizedSettingsSearchQuery
+    ? SETTINGS_SEARCH_ITEMS
+      .map((item) => {
+        const category = settingsCategories.find((entry) => entry.id === item.category);
+        const haystack = [
+          item.title,
+          item.description,
+          category?.label || "",
+          category?.description || "",
+          ...item.keywords,
+        ].join(" ").toLowerCase();
+        return settingsSearchTokens.every((token) => haystack.includes(token)) ? { ...item, categoryLabel: category?.label || item.category } : null;
+      })
+      .filter((item): item is SettingsSearchItem & { categoryLabel: string } => Boolean(item))
+      .slice(0, 8)
+    : [];
+  const llmApiKeyReady = hasUsableApiKey(form?.llm_api_key, form?.llm_api_key_configured);
+  const visualApiKeyReady = hasUsableApiKey(form?.visual_evidence_api_key, form?.visual_evidence_api_key_configured) || llmApiKeyReady;
+  const knowledgeLlmApiKeyReady = hasUsableApiKey(form?.knowledge_llm_api_key, form?.knowledge_llm_api_key_configured);
+  const llmEnabled = Boolean(form?.llm_enabled);
+  const visualMultimodalEnabled = Boolean(form?.visual_multimodal_enabled);
+  const llmReady = Boolean(form?.llm_enabled && llmApiKeyReady && String(form?.llm_base_url || "").trim() && String(form?.llm_model || "").trim());
+  const visualLlmReady = Boolean(
+    form?.visual_multimodal_enabled
+    && visualApiKeyReady
+    && String(form?.visual_evidence_base_url || form?.llm_base_url || "").trim()
+    && String(form?.visual_evidence_model || form?.llm_model || "").trim(),
+  );
+  const mainModelAvailability = modelAvailability.main;
+  const visualModelAvailability = modelAvailability.visual;
+  const mainModelStatusLabel = mainModelAvailability.status === "available"
+    ? "可用"
+    : mainModelAvailability.status === "unavailable"
+      ? "不可用"
+      : mainModelAvailability.status === "checking"
+        ? "检查中"
+        : llmReady
+          ? "可用"
+          : llmEnabled
+            ? "待配置"
+            : "关闭";
+  const mainModelStatusClass = mainModelAvailability.status === "available" || (mainModelAvailability.status === "unknown" && llmReady)
+    ? "success"
+    : mainModelAvailability.status === "unavailable"
+      ? "danger"
+      : mainModelAvailability.status === "checking" || llmEnabled
+        ? "warning"
+        : "";
+  const mainModelSummary = llmEnabled
+    ? mainModelAvailability.status === "unavailable"
+      ? "不可用"
+      : llmReady
+        ? "已配置"
+        : "待补全"
+    : "未启用";
+  const visualModelStatusLabel = visualModelAvailability.status === "available"
+    ? "可用"
+    : visualModelAvailability.status === "unavailable"
+      ? "不可用"
+      : visualModelAvailability.status === "checking"
+        ? "检查中"
+        : visualLlmReady
+          ? "可用"
+          : visualMultimodalEnabled
+            ? "待确认"
+            : "关闭";
+  const visualModelStatusClass = visualModelAvailability.status === "available" || (visualModelAvailability.status === "unknown" && visualLlmReady)
+    ? "success"
+    : visualModelAvailability.status === "unavailable"
+      ? "danger"
+      : visualModelAvailability.status === "checking" || visualMultimodalEnabled
+        ? "warning"
+        : "";
+  const visualModelSummary = visualMultimodalEnabled
+    ? visualModelAvailability.status === "unavailable"
+      ? "不可用"
+      : visualLlmReady
+        ? "已配置"
+        : "跟随或待补全"
+    : "未启用";
+  const visualNotePreset = (() => {
+    const mode = form?.visual_note_mode || "text";
+    if (mode === "vlm_integrated") {
+      return "multimodal";
+    }
+    if (mode === "frame_insert") {
+      return "visual";
+    }
+    return "text";
+  })();
   const knowledgeLlmUsesCustom = String(form?.knowledge_llm_mode || "same_as_main").trim().toLowerCase() === "custom";
   const knowledgeLlmReady = knowledgeLlmUsesCustom
-    ? Boolean(form?.knowledge_llm_enabled && String(form?.knowledge_llm_base_url || "").trim() && String(form?.knowledge_llm_model || "").trim())
-    : Boolean(form?.llm_enabled && String(form?.llm_base_url || "").trim() && String(form?.llm_model || "").trim());
+    ? Boolean(form?.knowledge_llm_enabled && knowledgeLlmApiKeyReady && String(form?.knowledge_llm_base_url || "").trim() && String(form?.knowledge_llm_model || "").trim())
+    : Boolean(form?.llm_enabled && llmApiKeyReady && String(form?.llm_base_url || "").trim() && String(form?.llm_model || "").trim());
   const autoMindMapReady = Boolean(form?.auto_generate_mindmap);
   const currentVersion = desktop.version || snapshot.systemInfo?.application?.version || "-";
   const asrReady =
     form?.transcription_provider === "local"
       ? Boolean(environment?.localAsrAvailable)
-      : Boolean(form?.siliconflow_asr_api_key_configured);
+      : form?.transcription_provider === "multimodal"
+        ? Boolean(form?.multimodal_asr_api_key_configured && String(form?.multimodal_asr_base_url || "").trim() && String(form?.multimodal_asr_model || "").trim())
+        : Boolean(form?.siliconflow_asr_api_key_configured);
   const updateUnsupported = isUpdateUnsupported(updateInfo);
   const updateStatusLabel = getUpdateStatusLabel(updateInfo);
   const updateStatusTone = getUpdateStatusTone(updateInfo);
@@ -376,7 +978,7 @@ export function SettingsPage({
   ];
 
   useEffect(() => {
-    if (!form || activeCategory !== "fileManagement") {
+    if (!form || activeCategory !== "files") {
       return;
     }
     // 使用 setTimeout 延迟执行，避免阻塞 UI 渲染
@@ -422,6 +1024,17 @@ export function SettingsPage({
   }, [focusIssueRequest, form]);
 
   useEffect(() => {
+    if (!promptPresetRequest || !form) {
+      return;
+    }
+    if (lastHandledPromptPresetNonce.current === promptPresetRequest.nonce) {
+      return;
+    }
+    lastHandledPromptPresetNonce.current = promptPresetRequest.nonce;
+    openPromptPresetInSettings(promptPresetRequest.presetId);
+  }, [promptPresetRequest, form, promptPresets]);
+
+  useEffect(() => {
     if (!pendingFocusTarget) {
       return;
     }
@@ -461,6 +1074,7 @@ export function SettingsPage({
   if (!form) return <section className="grid-card empty-state-card">正在加载设置...</section>;
 
   const usesSiliconFlowAsr = form.transcription_provider === "siliconflow";
+  const usesMultimodalAsr = form.transcription_provider === "multimodal";
   const recommendedTaskConcurrency = form.transcription_provider === "local" ? 1 : 2;
   const performanceRecommendation = recommendedTaskConcurrency === 1
     ? "当前建议：本地 ASR / CPU 场景任务并发数设为 1，导图并发数设为 1。"
@@ -497,31 +1111,250 @@ export function SettingsPage({
   function updateForm(next: ServiceSettings) {
     setIsDirty(true);
     setForm(next);
+    setModelAvailability({
+      main: { status: "unknown", message: "" },
+      visual: { status: "unknown", message: "" },
+    });
+  }
+
+  function updateUndoPromptValues(oldValues: Record<string, string>) {
+    if (Object.keys(oldValues).length === 0) {
+      setUndoPromptValues(null);
+      return;
+    }
+    setUndoPromptValues((prev) => ({ ...(prev || {}), ...oldValues }));
+  }
+
+  function undoPromptReset() {
+    if (!form || !undoPromptValues) return;
+    updateForm({ ...form, ...undoPromptValues });
+    setUndoPromptValues(null);
+  }
+
+  function resetSummaryPrompt(field: "system" | "template") {
+    if (!form) return;
+    const defaultSystemPrompt = form.defaults?.summary_system_prompt || "";
+    const defaultUserTemplate = form.defaults?.summary_user_prompt_template || "";
+    const newSystemPrompt = field === "system" ? (defaultSystemPrompt || form.summary_system_prompt) : form.summary_system_prompt;
+    const newUserTemplate = field === "template" ? (defaultUserTemplate || form.summary_user_prompt_template) : form.summary_user_prompt_template;
+    const oldValues: Record<string, string> = {};
+    if (field === "system" && form.summary_system_prompt !== newSystemPrompt) {
+      oldValues.summary_system_prompt = form.summary_system_prompt || "";
+    }
+    if (field === "template" && form.summary_user_prompt_template !== newUserTemplate) {
+      oldValues.summary_user_prompt_template = form.summary_user_prompt_template || "";
+    }
+    updateUndoPromptValues(oldValues);
+    updateForm({
+      ...form,
+      summary_system_prompt: newSystemPrompt,
+      summary_user_prompt_template: newUserTemplate,
+    });
+  }
+
+  function resetKnowledgeNotePrompt(field: "system" | "template") {
+    if (!form) return;
+    const defaultSystemPrompt = form.defaults?.knowledge_note_system_prompt || form.knowledge_note_system_prompt;
+    const defaultUserTemplate = form.defaults?.knowledge_note_user_prompt_template || form.knowledge_note_user_prompt_template;
+    const newSystemPrompt = field === "system" ? defaultSystemPrompt : form.knowledge_note_system_prompt;
+    const newUserTemplate = field === "template" ? defaultUserTemplate : form.knowledge_note_user_prompt_template;
+    const oldValues: Record<string, string> = {};
+    if (field === "system" && form.knowledge_note_system_prompt !== newSystemPrompt) {
+      oldValues.knowledge_note_system_prompt = form.knowledge_note_system_prompt || "";
+    }
+    if (field === "template" && form.knowledge_note_user_prompt_template !== newUserTemplate) {
+      oldValues.knowledge_note_user_prompt_template = form.knowledge_note_user_prompt_template || "";
+    }
+    updateUndoPromptValues(oldValues);
+    updateForm({
+      ...form,
+      knowledge_note_system_prompt: newSystemPrompt,
+      knowledge_note_user_prompt_template: newUserTemplate,
+    });
+  }
+
+  function resetVisualNotePrompt(field: "system" | "template" | "planning" | "vlm") {
+    if (!form) return;
+    const defaultSystemPrompt = form.defaults?.visual_note_system_prompt || form.visual_note_system_prompt;
+    const defaultUserTemplate = form.defaults?.visual_note_user_prompt_template || form.visual_note_user_prompt_template;
+    const defaultPlanningPrompt = form.defaults?.visual_frame_planning_prompt || form.visual_frame_planning_prompt;
+    const defaultVlmPrompt = form.defaults?.visual_vlm_prompt || form.visual_vlm_prompt;
+    const newSystemPrompt = field === "system" ? defaultSystemPrompt : form.visual_note_system_prompt;
+    const newUserTemplate = field === "template" ? defaultUserTemplate : form.visual_note_user_prompt_template;
+    const newPlanningPrompt = field === "planning" ? defaultPlanningPrompt : form.visual_frame_planning_prompt;
+    const newVlmPrompt = field === "vlm" ? defaultVlmPrompt : form.visual_vlm_prompt;
+    const oldValues: Record<string, string> = {};
+    if (field === "system" && form.visual_note_system_prompt !== newSystemPrompt) {
+      oldValues.visual_note_system_prompt = form.visual_note_system_prompt || "";
+    }
+    if (field === "template" && form.visual_note_user_prompt_template !== newUserTemplate) {
+      oldValues.visual_note_user_prompt_template = form.visual_note_user_prompt_template || "";
+    }
+    if (field === "planning" && form.visual_frame_planning_prompt !== newPlanningPrompt) {
+      oldValues.visual_frame_planning_prompt = form.visual_frame_planning_prompt || "";
+    }
+    if (field === "vlm" && form.visual_vlm_prompt !== newVlmPrompt) {
+      oldValues.visual_vlm_prompt = form.visual_vlm_prompt || "";
+    }
+    updateUndoPromptValues(oldValues);
+    updateForm({
+      ...form,
+      visual_note_system_prompt: newSystemPrompt,
+      visual_note_user_prompt_template: newUserTemplate,
+      visual_frame_planning_prompt: newPlanningPrompt,
+      visual_vlm_prompt: newVlmPrompt,
+    });
+  }
+
+  function applyVisualNotePreset(preset: "text" | "visual" | "multimodal") {
+    if (!form) return;
+    if (preset === "text") {
+      updateForm({
+        ...form,
+        visual_note_mode: "text",
+        visual_evidence_enabled: false,
+        visual_evidence_use_llm: false,
+        visual_multimodal_enabled: false,
+      });
+      return;
+    }
+    if (preset === "visual") {
+      updateForm({
+        ...form,
+        visual_note_mode: "frame_insert",
+        visual_evidence_enabled: true,
+        visual_evidence_use_llm: false,
+        visual_multimodal_enabled: false,
+      });
+      return;
+    }
+    updateForm({
+      ...form,
+      visual_note_mode: "vlm_integrated",
+      visual_evidence_enabled: true,
+      visual_evidence_use_llm: true,
+      visual_multimodal_enabled: true,
+    });
   }
 
   function validateSettingsBeforeSave(nextForm: ServiceSettings): { message: string; category: SettingsCategory; targetKey: string } | null {
     if (!String(nextForm.host || "").trim()) {
       return {
         message: "请先填写监听地址。",
-        category: "general",
+        category: "maintenance",
         targetKey: "host",
       };
     }
     if (nextForm.transcription_provider === "siliconflow" && !String(nextForm.siliconflow_asr_base_url || "").trim()) {
       return {
         message: "请先填写 SiliconFlow Base URL。",
-        category: "model",
+        category: "transcription",
         targetKey: "siliconflow_asr_base_url",
       };
     }
     if (nextForm.llm_enabled && !String(nextForm.llm_base_url || "").trim()) {
       return {
         message: "请先填写 LLM API Base URL。",
-        category: "llm",
+        category: "generation",
         targetKey: "llm_base_url",
       };
     }
+    const promptValidationError = validatePromptTemplates(nextForm);
+    if (promptValidationError) {
+      return promptValidationError;
+    }
     return null;
+  }
+
+  function hasAllPromptTokens(template: string, tokens: string[]) {
+    return tokens.every((token) => template.includes(token));
+  }
+
+  function validatePromptTemplates(nextForm: ServiceSettings): { message: string; category: SettingsCategory; targetKey: string } | null {
+    const summaryTemplate = String(nextForm.summary_user_prompt_template || "");
+    if (!hasAllPromptTokens(summaryTemplate, ["{title}", "{transcript}", "{segments_json}"])) {
+      return {
+        message: "摘要 User Template 需要保留 {title}、{transcript}、{segments_json} 变量，否则任务无法稳定生成摘要。",
+        category: "prompts",
+        targetKey: "summary_user_prompt_template",
+      };
+    }
+    for (const fieldName of ["title", "overview", "bulletPoints", "chapters", "chapterGroups"]) {
+      if (!summaryTemplate.includes(fieldName)) {
+        return {
+          message: `摘要 User Template 需要保留 ${fieldName} 输出字段约束。`,
+          category: "prompts",
+          targetKey: "summary_user_prompt_template",
+        };
+      }
+    }
+
+    const knowledgeTemplate = String(nextForm.knowledge_note_user_prompt_template || "");
+    if (!hasAllPromptTokens(knowledgeTemplate, ["{title}", "{summary_json}"])) {
+      return {
+        message: "知识笔记 User Template 至少需要保留 {title} 与 {summary_json} 变量。",
+        category: "prompts",
+        targetKey: "knowledge_note_user_prompt_template",
+      };
+    }
+    if (!knowledgeTemplate.includes("knowledgeNoteMarkdown")) {
+      return {
+        message: "知识笔记 User Template 需要保留 knowledgeNoteMarkdown 输出字段，否则任务会解析失败。",
+        category: "prompts",
+        targetKey: "knowledge_note_user_prompt_template",
+      };
+    }
+
+    const visualPlanningPrompt = String(nextForm.visual_frame_planning_prompt || "");
+    if (!hasAllPromptTokens(visualPlanningPrompt, ["{title}", "{summary_json}"])) {
+      return {
+        message: "捕获帧规划 Prompt 至少需要保留 {title} 与 {summary_json} 变量。",
+        category: "prompts",
+        targetKey: "visual_frame_planning_prompt",
+      };
+    }
+
+    const visualVlmPrompt = String(nextForm.visual_vlm_prompt || "");
+    if (!hasAllPromptTokens(visualVlmPrompt, ["{title}", "{timestamp}"])) {
+      return {
+        message: "画面理解 Prompt 至少需要保留 {title} 与 {timestamp} 变量。",
+        category: "prompts",
+        targetKey: "visual_vlm_prompt",
+      };
+    }
+
+    const visualNoteTemplate = String(nextForm.visual_note_user_prompt_template || "");
+    if (!hasAllPromptTokens(visualNoteTemplate, ["{title}", "{knowledge_note_markdown}", "{visual_observations_json}"])) {
+      return {
+        message: "图文笔记 User Template 需要保留 {title}、{knowledge_note_markdown}、{visual_observations_json} 变量。",
+        category: "prompts",
+        targetKey: "visual_note_user_prompt_template",
+      };
+    }
+    return null;
+  }
+
+  function buildSettingsSavePayload(nextForm: ServiceSettings): Partial<ServiceSettings> {
+    const payload: Partial<ServiceSettings> = {
+      ...nextForm,
+      device_preference: normalizeDevicePreference(nextForm.device_preference),
+    };
+    if (nextForm.siliconflow_asr_api_key_configured && (!String(nextForm.siliconflow_asr_api_key || "").trim() || isMaskedApiKey(nextForm.siliconflow_asr_api_key))) {
+      delete payload.siliconflow_asr_api_key;
+    }
+    if (nextForm.multimodal_asr_api_key_configured && (!String(nextForm.multimodal_asr_api_key || "").trim() || isMaskedApiKey(nextForm.multimodal_asr_api_key))) {
+      delete payload.multimodal_asr_api_key;
+    }
+    if (nextForm.llm_api_key_configured && (!String(nextForm.llm_api_key || "").trim() || isMaskedApiKey(nextForm.llm_api_key))) {
+      delete payload.llm_api_key;
+    }
+    if (nextForm.knowledge_llm_api_key_configured && (!String(nextForm.knowledge_llm_api_key || "").trim() || isMaskedApiKey(nextForm.knowledge_llm_api_key))) {
+      delete payload.knowledge_llm_api_key;
+    }
+    if (nextForm.visual_evidence_api_key_configured && (!String(nextForm.visual_evidence_api_key || "").trim() || isMaskedApiKey(nextForm.visual_evidence_api_key))) {
+      delete payload.visual_evidence_api_key;
+    }
+    return payload;
   }
 
   async function save(event: FormEvent) {
@@ -536,12 +1369,9 @@ export function SettingsPage({
     }
     try {
       setIsSaving(true);
-      const response = await api.updateSettings({
-        ...form,
-        device_preference: normalizeDevicePreference(form.device_preference),
-      });
+      const response = await api.updateSettings(buildSettingsSavePayload(form));
       const nextSettings = response.settings;
-      setForm(nextSettings);
+      setForm(maskConfiguredApiKeys(nextSettings));
       setIsDirty(false);
       setSaveStatus(response.message || "设置已保存");
       void (async () => {
@@ -574,11 +1404,10 @@ export function SettingsPage({
       if (response.installed) {
         try {
           const settingsResponse = await api.updateSettings({
-            ...form,
+            ...buildSettingsSavePayload(form),
             transcription_provider: "local",
-            device_preference: normalizeDevicePreference(form.device_preference),
           });
-          setForm(settingsResponse.settings);
+          setForm(maskConfiguredApiKeys(settingsResponse.settings));
           setIsDirty(false);
           setSaveStatus(settingsResponse.message || "已切换为本地 ASR");
           onSettingsSaved(settingsResponse.settings, nextEnvironment);
@@ -613,25 +1442,111 @@ export function SettingsPage({
     }
   }
 
+  async function captureBilibiliLoginCookies() {
+    if (!form || bilibiliCookieCapturing) {
+      return;
+    }
+    try {
+      setBilibiliCookieCapturing(true);
+      setBilibiliQrcodeKey("");
+      setBilibiliQrcodeImage("");
+      const desktopBilibili = window.desktop?.bilibili;
+      if (!desktopBilibili) {
+        setBilibiliCookieStatus("正在生成 B 站扫码登录二维码...");
+        const login = await api.createBilibiliCookieQrcode();
+        const image = await QRCode.toDataURL(login.url, {
+          margin: 1,
+          width: 180,
+          color: {
+            dark: "#111111",
+            light: "#ffffff",
+          },
+        });
+        setBilibiliQrcodeKey(login.qrcodeKey);
+        setBilibiliQrcodeImage(image);
+        setBilibiliCookieStatus("请用手机 B 站扫码，并在手机上确认登录。");
+        return;
+      }
+      setBilibiliCookieStatus("请在新窗口登录 B 站，登录成功后会自动保存 cookies...");
+      const captured: BilibiliCookieCaptureResult = await desktopBilibili.captureLoginCookies();
+      const response = await api.updateSettings({
+        ytdlp_cookies_file: captured.cookiesFile,
+        ytdlp_cookies_browser: "",
+      });
+      const nextSettings = maskConfiguredApiKeys(response.settings);
+      setForm(nextSettings);
+      setIsDirty(false);
+      setSaveStatus(response.message || "设置已保存");
+      const browserSuffix = captured.browser ? `（${captured.browser}）` : "";
+      setBilibiliCookieStatus(`B 站登录态已保存${browserSuffix}，捕获 ${captured.cookieCount} 条 cookies。`);
+      onSettingsSaved(response.settings, environment);
+    } catch (error) {
+      setBilibiliCookieStatus(error instanceof Error ? error.message : "捕获 B 站登录态失败，请按教程手动导出 cookies.txt。");
+    } finally {
+      setBilibiliCookieCapturing(false);
+    }
+  }
+
+  function buildLlmTestPayload(scope: GenerationModelScope) {
+    if (!form) {
+      return null;
+    }
+    if (scope === "main") {
+      return {
+        llm_enabled: form.llm_enabled,
+        llm_provider: form.llm_provider,
+        llm_base_url: form.llm_base_url,
+        llm_model: form.llm_model,
+        ...(form.llm_api_key.trim() && !isMaskedApiKey(form.llm_api_key) ? { llm_api_key: form.llm_api_key } : {}),
+      };
+    }
+    const visualApiKey = String(form.visual_evidence_api_key || "").trim();
+    const mainApiKey = String(form.llm_api_key || "").trim();
+    return {
+      llm_test_scope: "visual" as const,
+      llm_enabled: form.visual_multimodal_enabled,
+      llm_provider: form.visual_vlm_provider || form.llm_provider,
+      llm_base_url: form.visual_evidence_base_url || form.llm_base_url,
+      llm_model: form.visual_evidence_model || form.llm_model,
+      ...(!visualApiKey || isMaskedApiKey(visualApiKey)
+        ? mainApiKey && !isMaskedApiKey(mainApiKey)
+          ? { llm_api_key: mainApiKey }
+          : {}
+        : { llm_api_key: visualApiKey }),
+    };
+  }
+
+  async function runLlmConnectionTest(scope: GenerationModelScope) {
+    const payload = buildLlmTestPayload(scope);
+    if (!payload) {
+      throw new Error("模型配置尚未加载。");
+    }
+    return api.testLlmConnection(payload);
+  }
+
   async function testLlmConnection() {
     if (!form || llmTestBusy) {
       return;
     }
     try {
       setLlmTestBusy(true);
+      setLlmTestNoticeVersion((current) => current + 1);
       setLlmTestStatus("正在测试 LLM 连接与 JSON 输出...");
-      const response = await api.testLlmConnection({
-        llm_enabled: form.llm_enabled,
-        llm_provider: form.llm_provider,
-        llm_base_url: form.llm_base_url,
-        llm_api_key: form.llm_api_key,
-        llm_model: form.llm_model,
-      });
+      const response = await runLlmConnectionTest("main");
       const preview = response.jsonPreview || response.responsePreview;
       const suffix = preview ? `，示例：${preview}` : "";
       setLlmTestStatus(`${response.message}${suffix}`);
+      setModelAvailability((current) => ({
+        ...current,
+        main: { status: "available", message: response.message },
+      }));
     } catch (error) {
-      setLlmTestStatus(error instanceof Error ? error.message : "LLM 连接测试失败");
+      const message = error instanceof Error ? error.message : "LLM 连接测试失败";
+      setLlmTestStatus(message);
+      setModelAvailability((current) => ({
+        ...current,
+        main: { status: "unavailable", message },
+      }));
     } finally {
       setLlmTestBusy(false);
     }
@@ -643,12 +1558,15 @@ export function SettingsPage({
     }
     try {
       setLlmTestBusy(true);
+      setLlmTestNoticeVersion((current) => current + 1);
       setLlmTestStatus("正在测试知识库 LLM 连接与 JSON 输出...");
       const response = await api.testLlmConnection({
+        llm_test_scope: "knowledge",
         llm_enabled: form.knowledge_llm_enabled,
+        llm_provider: form.knowledge_llm_provider,
         llm_base_url: form.knowledge_llm_base_url,
-        llm_api_key: form.knowledge_llm_api_key,
         llm_model: form.knowledge_llm_model,
+        ...(form.knowledge_llm_api_key.trim() && !isMaskedApiKey(form.knowledge_llm_api_key) ? { llm_api_key: form.knowledge_llm_api_key } : {}),
       });
       const preview = response.jsonPreview || response.responsePreview;
       const suffix = preview ? `，示例：${preview}` : "";
@@ -657,6 +1575,76 @@ export function SettingsPage({
       setLlmTestStatus(error instanceof Error ? error.message : "知识库 LLM 连接测试失败");
     } finally {
       setLlmTestBusy(false);
+    }
+  }
+
+  async function testVisualLlmConnection() {
+    if (!form || llmTestBusy) {
+      return;
+    }
+    try {
+      setLlmTestBusy(true);
+      setLlmTestNoticeVersion((current) => current + 1);
+      setLlmTestStatus("正在测试视觉模型连接与 JSON 输出...");
+      const response = await runLlmConnectionTest("visual");
+      const preview = response.jsonPreview || response.responsePreview;
+      const suffix = preview ? `，示例：${preview}` : "";
+      setLlmTestStatus(`${response.message}${suffix}`);
+      setModelAvailability((current) => ({
+        ...current,
+        visual: { status: "available", message: response.message },
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "视觉模型连接测试失败";
+      setLlmTestStatus(message);
+      setModelAvailability((current) => ({
+        ...current,
+        visual: { status: "unavailable", message },
+      }));
+    } finally {
+      setLlmTestBusy(false);
+    }
+  }
+
+  function closeGenerationModelDialog() {
+    const scope = generationModelDialog;
+    setGenerationModelDialog(null);
+    if (!scope) {
+      return;
+    }
+    void silentlyCheckGenerationModel(scope);
+  }
+
+  async function silentlyCheckGenerationModel(scope: GenerationModelScope) {
+    if (!form || llmTestBusy) {
+      return;
+    }
+    const runId = silentModelCheckRunId.current + 1;
+    silentModelCheckRunId.current = runId;
+    setModelAvailability((current) => ({
+      ...current,
+      [scope]: { status: "checking", message: "" },
+    }));
+    try {
+      const response = await runLlmConnectionTest(scope);
+      if (silentModelCheckRunId.current !== runId) {
+        return;
+      }
+      setModelAvailability((current) => ({
+        ...current,
+        [scope]: { status: "available", message: response.message },
+      }));
+    } catch (error) {
+      if (silentModelCheckRunId.current !== runId) {
+        return;
+      }
+      setModelAvailability((current) => ({
+        ...current,
+        [scope]: {
+          status: "unavailable",
+          message: error instanceof Error ? error.message : "模型不可用",
+        },
+      }));
     }
   }
 
@@ -670,8 +1658,11 @@ export function SettingsPage({
       const response = await api.testAsrConnection({
         transcription_provider: form.transcription_provider,
         siliconflow_asr_base_url: form.siliconflow_asr_base_url,
-        siliconflow_asr_api_key: form.siliconflow_asr_api_key,
         siliconflow_asr_model: form.siliconflow_asr_model,
+        ...(form.siliconflow_asr_api_key.trim() && !isMaskedApiKey(form.siliconflow_asr_api_key) ? { siliconflow_asr_api_key: form.siliconflow_asr_api_key } : {}),
+        multimodal_asr_base_url: form.multimodal_asr_base_url,
+        multimodal_asr_model: form.multimodal_asr_model,
+        ...(form.multimodal_asr_api_key.trim() && !isMaskedApiKey(form.multimodal_asr_api_key) ? { multimodal_asr_api_key: form.multimodal_asr_api_key } : {}),
       });
       const preview = response.responsePreview ? `，示例：${response.responsePreview}` : "";
       setAsrTestStatus(`${response.message}${preview}`);
@@ -715,18 +1706,27 @@ export function SettingsPage({
     };
   }
 
+  function focusSettingTarget(category: SettingsCategory, targetKey: string) {
+    setActiveCategory(category);
+    setPendingFocusTarget(targetKey);
+    setSettingsSearchQuery("");
+  }
+
   function resolveIssueTarget(issueKey: string): { category: SettingsCategory; targetKey: string } | null {
     if (!form) {
       return null;
     }
     if (issueKey === "siliconflow_asr_api_key") {
-      return { category: "model", targetKey: "siliconflow_asr_api_key" };
+      return { category: "transcription", targetKey: "siliconflow_asr_api_key" };
+    }
+    if (issueKey === "multimodal_asr_base_url") {
+      return { category: "transcription", targetKey: "multimodal_asr_base_url" };
     }
     if (issueKey === "local_asr_runtime") {
-      return { category: "environment", targetKey: "local_asr_runtime" };
+      return { category: "runtime", targetKey: "local_asr_runtime" };
     }
     if (issueKey === "auto_mindmap_requires_llm") {
-      return { category: "llm", targetKey: "llm_enabled" };
+      return { category: "generation", targetKey: "llm_enabled" };
     }
     if (issueKey === "knowledge_dependencies") {
       return { category: "knowledge", targetKey: "knowledge_dependencies" };
@@ -739,36 +1739,42 @@ export function SettingsPage({
         if (!String(form.knowledge_llm_base_url || "").trim()) {
           return { category: "knowledge", targetKey: "knowledge_llm_base_url" };
         }
+        if (!hasUsableApiKey(form.knowledge_llm_api_key, form.knowledge_llm_api_key_configured)) {
+          return { category: "knowledge", targetKey: "knowledge_llm_api_key" };
+        }
         if (!String(form.knowledge_llm_model || "").trim()) {
           return { category: "knowledge", targetKey: "knowledge_llm_model" };
         }
         return { category: "knowledge", targetKey: "knowledge_llm_base_url" };
       }
       if (!form.llm_enabled) {
-        return { category: "llm", targetKey: "llm_enabled" };
+        return { category: "generation", targetKey: "llm_enabled" };
       }
       if (!String(form.llm_base_url || "").trim()) {
-        return { category: "llm", targetKey: "llm_base_url" };
+        return { category: "generation", targetKey: "llm_base_url" };
+      }
+      if (!hasUsableApiKey(form.llm_api_key, form.llm_api_key_configured)) {
+        return { category: "generation", targetKey: "llm_api_key" };
       }
       if (!String(form.llm_model || "").trim()) {
-        return { category: "llm", targetKey: "llm_model" };
+        return { category: "generation", targetKey: "llm_model" };
       }
       return { category: "knowledge", targetKey: "knowledge_llm_mode" };
     }
     if (issueKey === "llm_configuration") {
       if (!String(form.llm_base_url || "").trim()) {
-        return { category: "llm", targetKey: "llm_base_url" };
+        return { category: "generation", targetKey: "llm_base_url" };
       }
-      if (!form.llm_api_key_configured && !String(form.llm_api_key || "").trim()) {
-        return { category: "llm", targetKey: "llm_api_key" };
+      if (!hasUsableApiKey(form.llm_api_key, form.llm_api_key_configured)) {
+        return { category: "generation", targetKey: "llm_api_key" };
       }
       if (!String(form.llm_model || "").trim()) {
-        return { category: "llm", targetKey: "llm_model" };
+        return { category: "generation", targetKey: "llm_model" };
       }
-      return { category: "llm", targetKey: "llm_base_url" };
+      return { category: "generation", targetKey: "llm_base_url" };
     }
     if (issueKey === "ytdlp_cookies_browser" || issueKey === "ytdlp_cookies_file") {
-      return { category: "advanced", targetKey: "ytdlp_cookies_file" };
+      return { category: "video", targetKey: "ytdlp_cookies_file" };
     }
     return null;
   }
@@ -783,13 +1789,13 @@ export function SettingsPage({
           { id: "settings-knowledge-deps-status", message: knowledgeDepsStatus },
           { id: "settings-runtime-status", message: runtimeStatusMessage },
           { id: "settings-asr-test-status", message: asrTestStatus },
-          { id: "settings-llm-test-status", message: llmTestStatus },
+          { id: "settings-llm-test-status", message: llmTestStatus, version: llmTestNoticeVersion },
           { id: "settings-storage-status", message: storageStatus },
           { id: "settings-backend-error", message: desktop.backend?.lastError || "", tone: "error" },
           { id: "settings-service-status", message: serviceStatus },
         ]}
       />
-      <aside className="settings-nav">
+      <aside className="settings-nav" ref={settingsNavRef}>
         <div className="settings-nav-header">
           <span className="settings-nav-label-small">BiliSum</span>
           <div className="settings-nav-brand-card">
@@ -812,9 +1818,9 @@ export function SettingsPage({
         </div>
         <div className="settings-nav-list">
           <div className="settings-nav-group">
-            <span className="settings-nav-group-label">工作区</span>
+            <span className="settings-nav-group-label">工作流</span>
             <nav className="settings-nav-links">
-              {workspaceCategories.map((category) => (
+              {workflowCategories.map((category) => (
                 <button
                   key={category.id}
                   className={`settings-nav-item ${activeCategory === category.id ? "active" : ""}`}
@@ -856,7 +1862,7 @@ export function SettingsPage({
           </button>
           <div className="settings-nav-summary">
             <div className="settings-nav-summary-row">
-              <span>运行时</span>
+              <span>运行环境</span>
               <strong>{environment?.runtimeChannel || form.runtime_channel || "base"}</strong>
             </div>
             <div className="settings-nav-summary-row">
@@ -876,7 +1882,45 @@ export function SettingsPage({
       </aside>
 
       <main className="settings-content">
-        <div className="settings-content-scroll">
+        <div className="settings-content-scroll" ref={settingsContentScrollRef}>
+          <section className="settings-search-panel" aria-label="搜索设置">
+            <div className="settings-search-box">
+              <SearchIcon className="settings-search-icon" aria-hidden="true" />
+              <input
+                className="settings-search-input"
+                type="search"
+                value={settingsSearchQuery}
+                onChange={(event) => setSettingsSearchQuery(event.target.value)}
+                placeholder="搜索设置，例如 API Key、输出目录、知识笔记、并发、Cookies"
+              />
+              {settingsSearchQuery ? (
+                <button className="settings-search-clear" type="button" onClick={() => setSettingsSearchQuery("")}>
+                  清空
+                </button>
+              ) : null}
+            </div>
+            {normalizedSettingsSearchQuery ? (
+              <div className="settings-search-results" role="listbox" aria-label="设置搜索结果">
+                {settingsSearchResults.length ? settingsSearchResults.map((item) => (
+                  <button
+                    key={`${item.category}:${item.targetKey}`}
+                    className="settings-search-result"
+                    type="button"
+                    role="option"
+                    onClick={() => focusSettingTarget(item.category, item.targetKey)}
+                  >
+                    <span className="settings-search-result-main">
+                      <strong>{item.title}</strong>
+                      <span>{item.description}</span>
+                    </span>
+                    <span className="settings-search-result-category">{item.categoryLabel}</span>
+                  </button>
+                )) : (
+                  <div className="settings-search-empty">没有找到相关设置，换个关键词试试。</div>
+                )}
+              </div>
+            ) : null}
+          </section>
           <header className="settings-page-hero">
             <div className="settings-page-hero-copy">
               <span className="settings-page-kicker">Settings</span>
@@ -941,7 +1985,7 @@ export function SettingsPage({
                 <div className="settings-story-copy">
                   <span className="settings-story-kicker">概览</span>
                   <h3>当前配置与运行状态</h3>
-                  <p>这里展示运行时、模型、摘要模式和服务状态。排障时请切换到环境检测或日志。</p>
+                  <p>这里展示运行环境、模型、摘要模式和服务状态。排障时请切换到环境检测或日志。</p>
                 </div>
                 <div className="settings-story-stats">
                   <div className="settings-story-stat">
@@ -982,7 +2026,7 @@ export function SettingsPage({
                     </svg>
                   </div>
                   <div className="overview-status-info">
-                    <span className="overview-status-label">运行时</span>
+                    <span className="overview-status-label">运行环境</span>
                     <strong className="overview-status-value">{environment?.runtimeChannel || form.runtime_channel || "base"}</strong>
                   </div>
                 </div>
@@ -994,7 +2038,7 @@ export function SettingsPage({
                   </div>
                   <div className="overview-status-info">
                     <span className="overview-status-label">推理设备</span>
-                    <strong className="overview-status-value">{form.transcription_provider === "siliconflow" ? "云端识别" : devicePreferenceLabel(form.whisper_device)}</strong>
+                    <strong className="overview-status-value">{form.transcription_provider === "local" ? devicePreferenceLabel(form.whisper_device) : "云端识别"}</strong>
                   </div>
                 </div>
                 <div className="overview-status-card">
@@ -1023,9 +2067,13 @@ export function SettingsPage({
                         ? asrReady
                           ? "硅基流动已配置"
                           : "硅基流动待补全"
-                        : localAsrInstalled
-                          ? "本地 ASR 已安装"
-                          : "本地 ASR 未安装"}
+                        : form.transcription_provider === "multimodal"
+                          ? asrReady
+                            ? "多模态 ASR 已配置"
+                            : "多模态 ASR 待补全"
+                          : localAsrInstalled
+                            ? "本地 ASR 已安装"
+                            : "本地 ASR 未安装"}
                     </strong>
                   </div>
                 </div>
@@ -1102,7 +2150,7 @@ export function SettingsPage({
                   </div>
                   <div className="overview-info-item">
                     <span className="overview-info-label">ASR 模型</span>
-                    <span className="overview-info-value">{form.transcription_provider === "siliconflow" ? form.siliconflow_asr_model : form.fixed_model}</span>
+                    <span className="overview-info-value">{form.transcription_provider === "local" ? form.fixed_model : form.transcription_provider === "multimodal" ? form.multimodal_asr_model : form.siliconflow_asr_model}</span>
                   </div>
                 </div>
               </div>
@@ -1110,20 +2158,20 @@ export function SettingsPage({
               <div className="overview-section">
                 <h3 className="overview-section-title">快速操作</h3>
                 <div className="overview-actions">
-                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("environment")}>环境设置</button>
+                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("runtime")}>运行环境维护</button>
                   <button className="tertiary-button" type="button" onClick={() => setActiveCategory("logs")}>查看日志</button>
-                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("model")}>模型配置</button>
-                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("llm")}>LLM 设置</button>
+                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("transcription")}>转写设置</button>
+                  <button className="tertiary-button" type="button" onClick={() => setActiveCategory("generation")}>摘要设置</button>
                 </div>
               </div>
             </section>
           )}
 
-          {activeCategory === "general" && (
+          {activeCategory === "maintenance" && (
             <section className="settings-category-section">
               <header className="settings-category-header">
-                <h2>基础设置</h2>
-                <p>服务监听地址和端口配置。</p>
+                <h2>维护与诊断</h2>
+                <p>服务监听地址和端口配置。一般不需要改，只有端口冲突或外部接入时再调整。</p>
               </header>
               <div className="settings-form-group">
                 <label className="settings-input-group">
@@ -1138,36 +2186,85 @@ export function SettingsPage({
                 </label>
                 <label className="settings-input-group">
                   <span className="settings-input-label">监听端口</span>
-                  <input className="settings-input-field" type="number" value={form.port} onChange={(e) => updateForm({ ...form, port: parseInt(e.target.value) || 3838 })} />
+                  <input
+                    className="settings-input-field"
+                    ref={registerFocusTarget("port") as (node: HTMLInputElement | null) => void}
+                    type="number"
+                    value={form.port}
+                    onChange={(e) => updateForm({ ...form, port: parseInt(e.target.value) || 3838 })}
+                  />
                   <span className="settings-input-caption">服务端口号，默认 3838</span>
                 </label>
               </div>
             </section>
           )}
-
-          {activeCategory === "directories" && (
+          {activeCategory === "maintenance" && (
             <section className="settings-category-section">
               <header className="settings-category-header">
-                <h2>目录设置</h2>
-                <p>数据存储和缓存目录配置。</p>
+                <h2>界面重置</h2>
+                <p>重置首次使用引导等界面提示，方便再次查看。</p>
               </header>
               <div className="settings-form-group">
-                <label className="settings-input-group">
+                <div className="settings-reset-row">
+                  <div className="settings-reset-row-copy">
+                    <span className="settings-input-label">首页引导</span>
+                    <span className="settings-input-caption">清空「首次进入首页」的引导记录，下次进入首页时会重新显示功能指引。</span>
+                  </div>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => {
+                      window.localStorage.removeItem("bilisum.homeTourSeen");
+                      window.localStorage.removeItem("bilisum.summaryPreferenceHintSeen");
+                      setSaveStatus("已清空首页引导记录，下次进入首页将重新显示。");
+                    }}
+                  >
+                    重新显示
+                  </button>
+                </div>
+                <div className="settings-reset-row">
+                  <div className="settings-reset-row-copy">
+                    <span className="settings-input-label">配置引导</span>
+                    <span className="settings-input-caption">重新打开首次配置引导助手，可逐步补全运行所需配置。</span>
+                  </div>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => {
+                      onOpenSetupAssistant();
+                      setSaveStatus("已打开配置引导。");
+                    }}
+                  >
+                    打开配置引导
+                  </button>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {activeCategory === "files" && (
+            <section className="settings-category-section">
+              <header className="settings-category-header">
+                <h2>输出与文件</h2>
+                <p>管理导出位置、应用数据目录和本地空间占用。</p>
+              </header>
+              <div className="settings-form-group">
+                <label className="settings-input-group" ref={registerFocusTarget("data_dir") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">数据目录</span>
                   <input className="settings-input-field" value={String(form.data_dir)} onChange={(e) => updateForm({ ...form, data_dir: e.target.value })} />
                   <span className="settings-input-caption">存储视频摘要和元数据</span>
                 </label>
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("cache_dir") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">缓存目录</span>
                   <input className="settings-input-field" value={String(form.cache_dir)} onChange={(e) => updateForm({ ...form, cache_dir: e.target.value })} />
                   <span className="settings-input-caption">临时缓存文件</span>
                 </label>
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("tasks_dir") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">任务目录</span>
                   <input className="settings-input-field" value={String(form.tasks_dir)} onChange={(e) => updateForm({ ...form, tasks_dir: e.target.value })} />
                   <span className="settings-input-caption">任务历史记录</span>
                 </label>
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("output_dir") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">输出目录</span>
                   <input className="settings-input-field" value={String(form.output_dir)} onChange={(e) => updateForm({ ...form, output_dir: e.target.value })} />
                   <span className="settings-input-caption">手动导出的 Markdown / Obsidian 笔记会写入这里。</span>
@@ -1176,14 +2273,14 @@ export function SettingsPage({
             </section>
           )}
 
-          {activeCategory === "fileManagement" && (
+          {activeCategory === "files" && (
             <section className="settings-category-section">
               <header className="settings-category-header">
                 <h2>文件管理</h2>
                 <p>查看本地空间占用，并安全清理缓存和孤儿任务目录。</p>
               </header>
 
-              <div className="settings-update-overview">
+              <div className="settings-update-overview" ref={registerFocusTarget("storage_cleanup") as (node: HTMLDivElement | null) => void}>
                 <div className="settings-update-copy">
                   <span className="settings-story-kicker">Storage</span>
                   <h3>当前本地占用</h3>
@@ -1249,9 +2346,9 @@ export function SettingsPage({
                   <p>日志仅展示体积和位置，首版不提供清空操作，避免误删排障信息。</p>
                 </article>
                 <article className="settings-storage-panel">
-                  <span className="settings-update-label">运行时目录</span>
+                  <span className="settings-update-label">运行环境目录</span>
                   <strong>{formatStorageSize(runtimeDirectory?.sizeBytes || 0)}</strong>
-                  <p>运行时目录只做统计，不参与清理，避免影响 Python、Torch 或 CUDA 运行环境。</p>
+                  <p>运行环境目录只做统计，不参与清理，避免影响 Python、Torch 或 CUDA 运行环境。</p>
                 </article>
               </div>
 
@@ -1285,11 +2382,68 @@ export function SettingsPage({
             </section>
           )}
 
-          {activeCategory === "model" && (
+          {activeCategory === "video" && (
             <section className="settings-category-section">
               <header className="settings-category-header">
-                <h2>模型设置</h2>
-                <p>配置转写方式、云端参数和本地模型策略。</p>
+                <h2>视频获取</h2>
+                <p>处理 B 站登录态、下载缓存和转写临时音频。遇到风控、登录或重复下载问题时先看这里。</p>
+              </header>
+              <div className="settings-form-group">
+                <label
+                  className={`settings-input-group settings-focus-target ${activeFocusTarget === "ytdlp_cookies_file" ? "is-highlighted" : ""}`}
+                  ref={registerFocusTarget("ytdlp_cookies_file") as (node: HTMLLabelElement | null) => void}
+                >
+                  <span className="settings-input-label">B 站 Cookies 文件</span>
+                  <div className="settings-input-action-row">
+                    <input
+                      className="settings-input-field"
+                      value={form.ytdlp_cookies_file || ""}
+                      onChange={(e) => updateForm({ ...form, ytdlp_cookies_file: e.target.value })}
+                      placeholder="C:\\Users\\you\\Downloads\\cookies.txt"
+                    />
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={bilibiliCookieCapturing}
+                      onClick={() => void captureBilibiliLoginCookies()}
+                    >
+                      {bilibiliCookieCapturing ? "获取中..." : "登录获取"}
+                    </button>
+                  </div>
+                  <span className="settings-input-caption">推荐通过提示弹窗打开 B 站登录窗口自动生成；也可以手动填写从已登录浏览器导出的 cookies.txt。</span>
+                  {bilibiliQrcodeImage ? (
+                    <div className="settings-cookie-qrcode">
+                      <img src={bilibiliQrcodeImage} alt="B 站扫码登录二维码" />
+                      <span>用手机 B 站扫码确认后会自动写入 cookies 文件。</span>
+                    </div>
+                  ) : null}
+                  {bilibiliCookieStatus ? <span className="settings-input-caption">{bilibiliCookieStatus}</span> : null}
+                </label>
+                <label className="settings-input-group" ref={registerFocusTarget("enable_cache") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">启用下载缓存</span>
+                  <select className="settings-select-field" value={form.enable_cache ? "true" : "false"} onChange={(e) => updateForm({ ...form, enable_cache: e.target.value === "true" })}>
+                    <option value="true">开启</option>
+                    <option value="false">关闭</option>
+                  </select>
+                  <span className="settings-input-caption">开启后会复用封面、上传文件和部分中间结果，适合反复处理同一批视频。</span>
+                </label>
+                <label className="settings-input-group" ref={registerFocusTarget("preserve_temp_audio") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">保留临时音频</span>
+                  <select className="settings-select-field" value={form.preserve_temp_audio ? "true" : "false"} onChange={(e) => updateForm({ ...form, preserve_temp_audio: e.target.value === "true" })}>
+                    <option value="false">不保留</option>
+                    <option value="true">保留</option>
+                  </select>
+                  <span className="settings-input-caption">排查转写问题时可以临时开启；日常关闭能减少磁盘占用。</span>
+                </label>
+              </div>
+            </section>
+          )}
+
+          {activeCategory === "transcription" && (
+            <section className="settings-category-section">
+              <header className="settings-category-header">
+                <h2>语音转文字</h2>
+                <p>配置视频音频如何转成文本：云端 ASR 更省心，本地 ASR 更依赖运行环境和设备。</p>
               </header>
               <div className="settings-form-group">
                 <label className="settings-input-group">
@@ -1301,9 +2455,10 @@ export function SettingsPage({
                     onChange={(e) => updateForm({ ...form, transcription_provider: e.target.value })}
                   >
                     <option value="siliconflow">硅基流动 API</option>
+                    <option value="multimodal">多模态 ASR（第三方）</option>
                     <option value="local" disabled={!localAsrInstalled}>本地 ASR（需先安装）</option>
                   </select>
-                  <span className="settings-input-caption">默认推荐云端模式。</span>
+                  <span className="settings-input-caption">默认推荐云端模式（硅基流动的语音识别是免费的！只需要注册然后填上apikey就可以用了）。</span>
                 </label>
                 {usesSiliconFlowAsr ? (
                   <>
@@ -1320,13 +2475,23 @@ export function SettingsPage({
                       ref={registerFocusTarget("siliconflow_asr_api_key") as (node: HTMLLabelElement | null) => void}
                     >
                       <span className="settings-input-label">SiliconFlow API Key</span>
-                      <input className="settings-input-field" type="password" value={form.siliconflow_asr_api_key} onChange={(e) => updateForm({ ...form, siliconflow_asr_api_key: e.target.value })} placeholder="sk-..." />
+                      <input className="settings-input-field" type="password" value={form.siliconflow_asr_api_key} onFocus={selectMaskedApiKey} onChange={(e) => updateForm({ ...form, siliconflow_asr_api_key: e.target.value })} placeholder="sk-..." />
                       <SiliconFlowApiKeyHelp />
                     </label>
-                    <label className="settings-input-group">
-                      <span className="settings-input-label">ASR 模型</span>
+                    <label className="settings-input-group" ref={registerFocusTarget("siliconflow_asr_model") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">语音转写 ASR 模型</span>
                       <input className="settings-input-field" value={form.siliconflow_asr_model} onChange={(e) => updateForm({ ...form, siliconflow_asr_model: e.target.value })} placeholder="TeleAI/TeleSpeechASR" />
-                      <span className="settings-input-caption">首批支持 `TeleAI/TeleSpeechASR`。</span>
+                      <span className="settings-input-caption">推荐使用：TeleAI/TeleSpeechASR</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("siliconflow_asr_chunk_duration_seconds") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">ASR 切片时长（秒）</span>
+                      <input className="settings-input-field" type="number" min={60} max={3600} value={form.siliconflow_asr_chunk_duration_seconds ?? 1800} onChange={(e) => updateForm({ ...form, siliconflow_asr_chunk_duration_seconds: Number(e.target.value) })} />
+                      <span className="settings-input-caption">长音频按此时长切片，默认 1800 秒（30 分钟）。API 单次最长 60 分钟。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("siliconflow_asr_concurrency") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">ASR 并发数</span>
+                      <input className="settings-input-field" type="number" min={1} max={8} value={form.siliconflow_asr_concurrency ?? 2} onChange={(e) => updateForm({ ...form, siliconflow_asr_concurrency: Number(e.target.value) })} />
+                      <span className="settings-input-caption">同时发送的转写请求数，默认 2。</span>
                     </label>
                     <div className="settings-inline-actions">
                       <button
@@ -1342,9 +2507,55 @@ export function SettingsPage({
                       </span>
                     </div>
                   </>
+                ) : usesMultimodalAsr ? (
+                  <>
+                    <label
+                      className={`settings-input-group settings-focus-target ${activeFocusTarget === "multimodal_asr_base_url" ? "is-highlighted" : ""}`}
+                      ref={registerFocusTarget("multimodal_asr_base_url") as (node: HTMLLabelElement | null) => void}
+                    >
+                      <span className="settings-input-label">多模态 ASR Base URL</span>
+                      <input className="settings-input-field" value={form.multimodal_asr_base_url} onChange={(e) => updateForm({ ...form, multimodal_asr_base_url: e.target.value })} placeholder="https://api.example.com/v1" />
+                      <span className="settings-input-caption">支持 OpenAI 兼容的多模态 API 地址。</span>
+                    </label>
+                    <label
+                      className={`settings-input-group settings-focus-target ${activeFocusTarget === "multimodal_asr_api_key" ? "is-highlighted" : ""}`}
+                      ref={registerFocusTarget("multimodal_asr_api_key") as (node: HTMLLabelElement | null) => void}
+                    >
+                      <span className="settings-input-label">多模态 ASR API Key</span>
+                      <input className="settings-input-field" type="password" value={form.multimodal_asr_api_key} onFocus={selectMaskedApiKey} onChange={(e) => updateForm({ ...form, multimodal_asr_api_key: e.target.value })} placeholder="sk-..." />
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("multimodal_asr_model") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">多模态 ASR 模型</span>
+                      <input className="settings-input-field" value={form.multimodal_asr_model} onChange={(e) => updateForm({ ...form, multimodal_asr_model: e.target.value })} placeholder="mimo-v2-omni" />
+                      <span className="settings-input-caption">使用支持音频输入的多模态模型进行语音转文字。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("multimodal_asr_chunk_duration_seconds") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">多模态切片时长（秒）</span>
+                      <input className="settings-input-field" type="number" min={30} max={600} value={form.multimodal_asr_chunk_duration_seconds ?? 180} onChange={(e) => updateForm({ ...form, multimodal_asr_chunk_duration_seconds: Number(e.target.value) })} />
+                      <span className="settings-input-caption">长音频自动切片时每段的秒数，默认 180 秒（3 分钟）。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("multimodal_asr_max_retries") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">多模态切片重试次数</span>
+                      <input className="settings-input-field" type="number" min={0} max={10} value={form.multimodal_asr_max_retries ?? 5} onChange={(e) => updateForm({ ...form, multimodal_asr_max_retries: Number(e.target.value) })} />
+                      <span className="settings-input-caption">每段切片返回空时最多重试几次，默认 5 次。</span>
+                    </label>
+                    <div className="settings-inline-actions">
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        disabled={asrTestBusy}
+                        onClick={() => void testAsrConnection()}
+                      >
+                        {asrTestBusy ? "测试中..." : "测试 ASR 是否可用"}
+                      </button>
+                      <span className="settings-input-caption">
+                        使用当前表单中的多模态配置发起一次临时转写测试，不会保存设置。
+                      </span>
+                    </div>
+                  </>
                 ) : (
                   <>
-                    <label className="settings-input-group">
+                    <label className="settings-input-group" ref={registerFocusTarget("device_preference") as (node: HTMLLabelElement | null) => void}>
                       <span className="settings-input-label">推理设备</span>
                       <select className="settings-select-field" value={normalizeDevicePreference(form.device_preference)} onChange={(e) => updateForm({ ...form, device_preference: e.target.value })}>
                         <option value="auto">自动选择</option>
@@ -1361,7 +2572,7 @@ export function SettingsPage({
                       </select>
                       <span className="settings-input-caption">自动模式会根据设备选择最优模型</span>
                     </label>
-                    <label className="settings-input-group">
+                    <label className="settings-input-group" ref={registerFocusTarget("fixed_model") as (node: HTMLLabelElement | null) => void}>
                       <span className="settings-input-label">固定模型</span>
                       <input className="settings-input-field" value={form.fixed_model} onChange={(e) => updateForm({ ...form, fixed_model: e.target.value })} placeholder="tiny / base / small / medium / large-v3" />
                       <span className="settings-input-caption">Whisper 模型名称，小模型速度快但精度低</span>
@@ -1372,84 +2583,296 @@ export function SettingsPage({
             </section>
           )}
 
-          {activeCategory === "llm" && (
-            <section className="settings-category-section">
+          {activeCategory === "generation" && (
+            <section className="settings-category-section generation-settings-section">
               <header className="settings-category-header">
-                <h2>LLM 设置</h2>
-                <p>分别管理主摘要 LLM 与知识库 LLM。</p>
+                <h2>摘要生成</h2>
+                <p>按“基础生成、模型接入、自动产物、图文截图、长视频切块”分层管理，日常开关留在页面，密钥和模型细节放进悬浮窗。</p>
               </header>
-              <div className="settings-form-group">
-                <label className="settings-input-group">
-                  <span className="settings-input-label">启用 LLM 摘要</span>
-                  <select
-                    className="settings-select-field"
-                    ref={registerFocusTarget("llm_enabled") as (node: HTMLSelectElement | null) => void}
-                    value={form.llm_enabled ? "true" : "false"}
-                    onChange={(e) => updateForm({ ...form, llm_enabled: e.target.value === "true" })}
-                  >
-                    <option value="false">关闭</option>
-                    <option value="true">开启</option>
-                  </select>
-                  <span className="settings-input-caption">使用大语言模型生成更高质量的视频摘要</span>
-                </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">自动生成思维导图</span>
-                  <select className="settings-select-field" value={form.auto_generate_mindmap ? "true" : "false"} onChange={(e) => updateForm({ ...form, auto_generate_mindmap: e.target.value === "true" })}>
-                    <option value="false">关闭</option>
-                    <option value="true">开启</option>
-                  </select>
-                  <span className="settings-input-caption">任务摘要完成后，后台自动发起思维导图生成。关闭后仍可在详情页手动生成。</span>
-                </label>
-                {form.llm_enabled && (
-                  <>
+              <div className="generation-settings-tree">
+                <section className="settings-tree-panel">
+                  <header className="settings-tree-panel-header">
+                    <span className="settings-tree-index">01</span>
+                    <div>
+                      <h3>基础生成</h3>
+                      <p>控制摘要是否使用 LLM、输出语言和失败重试。</p>
+                    </div>
+                  </header>
+                  <div className="settings-tree-grid">
                     <label className="settings-input-group">
-                      <span className="settings-input-label">LLM 提供商</span>
-                      <select className="settings-select-field" value={form.llm_provider} onChange={(e) => updateForm({ ...form, llm_provider: e.target.value })}>
-                        <option value="openai-compatible">OpenAI Compatible</option>
-                        <option value="openai">OpenAI</option>
-                        <option value="anthropic">Anthropic</option>
-                        <option value="custom">自定义</option>
+                      <span className="settings-input-label">启用 LLM 摘要</span>
+                      <select
+                        className="settings-select-field"
+                        ref={registerFocusTarget("llm_enabled") as (node: HTMLSelectElement | null) => void}
+                        value={form.llm_enabled ? "true" : "false"}
+                        onChange={(e) => updateForm({ ...form, llm_enabled: e.target.value === "true" })}
+                      >
+                        <option value="false">关闭</option>
+                        <option value="true">开启</option>
+                      </select>
+                      <span className="settings-input-caption">使用大语言模型生成更高质量的视频摘要。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("summary_mode") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">摘要模式</span>
+                      <select className="settings-select-field" value={form.summary_mode} onChange={(e) => updateForm({ ...form, summary_mode: e.target.value })}>
+                        <option value="llm">LLM 智能摘要</option>
+                        <option value="extract">仅转写</option>
                       </select>
                     </label>
-                    <label
-                      className={`settings-input-group settings-focus-target ${activeFocusTarget === "llm_base_url" ? "is-highlighted" : ""}`}
-                      ref={registerFocusTarget("llm_base_url") as (node: HTMLLabelElement | null) => void}
-                    >
-                      <span className="settings-input-label">API Base URL</span>
-                      <input className="settings-input-field" value={form.llm_base_url} onChange={(e) => updateForm({ ...form, llm_base_url: e.target.value })} placeholder="https://api.openai.com/v1" />
-                      <span className="settings-input-caption">主摘要 LLM API 的基础 URL 地址。</span>
+                    <label className="settings-input-group" ref={registerFocusTarget("language") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">输出语言</span>
+                      <select className="settings-select-field" value={form.language} onChange={(e) => updateForm({ ...form, language: e.target.value })}>
+                        <option value="zh">中文</option>
+                        <option value="en">English</option>
+                        <option value="ja">日本語</option>
+                      </select>
                     </label>
-                    <label
-                      className={`settings-input-group settings-focus-target ${activeFocusTarget === "llm_api_key" ? "is-highlighted" : ""}`}
-                      ref={registerFocusTarget("llm_api_key") as (node: HTMLLabelElement | null) => void}
-                    >
-                      <span className="settings-input-label">API Key</span>
-                      <input className="settings-input-field" type="password" value={form.llm_api_key} onChange={(e) => updateForm({ ...form, llm_api_key: e.target.value })} placeholder="sk-..." />
-                      <span className="settings-input-caption">LLM 服务的 API 密钥</span>
+                    <label className="settings-input-group" ref={registerFocusTarget("summary_chunk_retry_count") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">重试次数</span>
+                      <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_retry_count} onChange={(e) => updateForm({ ...form, summary_chunk_retry_count: parseMinOneInt(e.target.value, 2) })} />
+                      <span className="settings-input-caption">摘要 API 调用失败时的重试次数。</span>
                     </label>
-                    <label
-                      className={`settings-input-group settings-focus-target ${activeFocusTarget === "llm_model" ? "is-highlighted" : ""}`}
-                      ref={registerFocusTarget("llm_model") as (node: HTMLLabelElement | null) => void}
-                    >
-                      <span className="settings-input-label">模型名称</span>
-                      <input className="settings-input-field" value={form.llm_model} onChange={(e) => updateForm({ ...form, llm_model: e.target.value })} placeholder="gpt-4o-mini / claude-3-haiku" />
-                      <span className="settings-input-caption">要使用的 LLM 模型名称</span>
-                    </label>
-                    <div className="settings-inline-actions">
-                      <button
-                        className="secondary-button"
-                        type="button"
-                        disabled={llmTestBusy}
-                        onClick={() => void testLlmConnection()}
-                      >
-                        {llmTestBusy ? "测试中..." : "测试是否可用"}
-                      </button>
-                      <span className="settings-input-caption">
-                        使用当前表单中的 Base URL、API Key 和模型名临时请求一次，并校验是否能返回合法 JSON，不会保存设置。
-                      </span>
+                  </div>
+                </section>
+
+                <section className="settings-tree-panel">
+                  <header className="settings-tree-panel-header">
+                    <span className="settings-tree-index">02</span>
+                    <div>
+                      <h3>模型接入</h3>
+                      <p>主摘要模型和视觉理解模型只展示状态，具体地址、密钥和测试放入悬浮窗。</p>
                     </div>
-                  </>
-                )}
+                  </header>
+                  <div className="settings-model-summary-grid">
+                    <article
+                      className={`settings-model-card settings-focus-target ${activeFocusTarget === "llm_base_url" || activeFocusTarget === "llm_api_key" || activeFocusTarget === "llm_model" ? "is-highlighted" : ""}`}
+                      ref={(node) => {
+                        registerFocusTarget("llm_base_url")(node);
+                        registerFocusTarget("llm_api_key")(node);
+                        registerFocusTarget("llm_model")(node);
+                      }}
+                    >
+                      <div className="settings-model-card-top">
+                        <div>
+                          <span className="settings-model-kicker">主摘要模型</span>
+                          <strong>{mainModelSummary}</strong>
+                        </div>
+                        <span className={`settings-status-pill ${mainModelStatusClass}`} title={mainModelAvailability.message || undefined}>{mainModelStatusLabel}</span>
+                      </div>
+                      <dl className="settings-model-meta">
+                        <div>
+                          <dt>Provider</dt>
+                          <dd>{form.llm_provider || "openai-compatible"}</dd>
+                        </div>
+                        <div>
+                          <dt>Model</dt>
+                          <dd>{form.llm_model || "未填写"}</dd>
+                        </div>
+                        <div>
+                          <dt>Base URL</dt>
+                          <dd>{form.llm_base_url || "未填写"}</dd>
+                        </div>
+                      </dl>
+                      <button className="secondary-button" type="button" onClick={() => setGenerationModelDialog("main")}>
+                        编辑与测试
+                      </button>
+                    </article>
+                    <article
+                      className={`settings-model-card settings-focus-target ${activeFocusTarget === "visual_multimodal_enabled" ? "is-highlighted" : ""}`}
+                      ref={registerFocusTarget("visual_multimodal_enabled") as (node: HTMLElement | null) => void}
+                    >
+                      <div className="settings-model-card-top">
+                        <div>
+                          <span className="settings-model-kicker">视觉理解模型</span>
+                          <strong>{visualModelSummary}</strong>
+                        </div>
+                        <span className={`settings-status-pill ${visualModelStatusClass}`} title={visualModelAvailability.message || undefined}>{visualModelStatusLabel}</span>
+                      </div>
+                      <dl className="settings-model-meta">
+                        <div>
+                          <dt>来源</dt>
+                          <dd>{form.visual_evidence_base_url || form.visual_evidence_model || hasUsableApiKey(form.visual_evidence_api_key, form.visual_evidence_api_key_configured) ? "独立配置" : "跟随主 LLM"}</dd>
+                        </div>
+                        <div>
+                          <dt>Model</dt>
+                          <dd>{form.visual_evidence_model || form.llm_model || "未填写"}</dd>
+                        </div>
+                        <div>
+                          <dt>Base URL</dt>
+                          <dd>{form.visual_evidence_base_url || form.llm_base_url || "未填写"}</dd>
+                        </div>
+                      </dl>
+                      <button className="secondary-button" type="button" onClick={() => setGenerationModelDialog("visual")}>
+                        编辑与测试
+                      </button>
+                    </article>
+                  </div>
+                </section>
+
+                <section className="settings-tree-panel">
+                  <header className="settings-tree-panel-header">
+                    <span className="settings-tree-index">03</span>
+                    <div>
+                      <h3>自动产物</h3>
+                      <p>摘要完成后是否自动追加导图和图文笔记。</p>
+                    </div>
+                  </header>
+                  <div className="settings-visual-note-presets" aria-label="知识笔记预设">
+                    <button
+                      type="button"
+                      className={`settings-visual-note-preset ${visualNotePreset === "text" ? "is-active" : ""}`}
+                      onClick={() => applyVisualNotePreset("text")}
+                    >
+                      <strong>纯文本笔记</strong>
+                      <span>只生成文本知识笔记。</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`settings-visual-note-preset ${visualNotePreset === "visual" ? "is-active" : ""}`}
+                      onClick={() => applyVisualNotePreset("visual")}
+                    >
+                      <strong>无多模态的图文笔记</strong>
+                      <span>抽帧并按文本语义插图。</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`settings-visual-note-preset ${visualNotePreset === "multimodal" ? "is-active" : ""}`}
+                      onClick={() => applyVisualNotePreset("multimodal")}
+                    >
+                      <strong>多模态理解的图文笔记</strong>
+                      <span>抽帧并调用 VLM 理解画面。</span>
+                    </button>
+                  </div>
+                  <div className="settings-tree-grid">
+                    <label className="settings-input-group" ref={registerFocusTarget("auto_generate_mindmap") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">自动生成思维导图</span>
+                      <select className="settings-select-field" value={form.auto_generate_mindmap ? "true" : "false"} onChange={(e) => updateForm({ ...form, auto_generate_mindmap: e.target.value === "true" })}>
+                        <option value="false">关闭</option>
+                        <option value="true">开启</option>
+                      </select>
+                      <span className="settings-input-caption">关闭后仍可在详情页手动生成。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("prompt_router_mode") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">Prompt 路由模式</span>
+                      <select
+                        className="settings-select-field"
+                        value={form.prompt_router_mode || "confirm"}
+                        onChange={(e) => updateForm({ ...form, prompt_router_mode: e.target.value })}
+                      >
+                        <option value="confirm">确认后使用推荐</option>
+                        <option value="auto">自动套用推荐</option>
+                      </select>
+                      <span className="settings-input-caption">首页会根据标题推荐摘要 Prompt。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("visual_note_mode") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">知识笔记形式</span>
+                      <select
+                        className="settings-select-field"
+                        value={form.visual_note_mode || "text"}
+                        onChange={(e) => {
+                          const nextMode = e.target.value as typeof form.visual_note_mode;
+                          updateForm({
+                            ...form,
+                            visual_note_mode: nextMode,
+                            visual_evidence_enabled: nextMode !== "text",
+                            visual_evidence_use_llm: nextMode === "vlm_integrated",
+                            visual_multimodal_enabled: nextMode === "vlm_integrated",
+                          });
+                        }}
+                      >
+                        <option value="text">纯文本笔记</option>
+                        <option value="frame_insert">插图笔记</option>
+                        <option value="vlm_integrated">理解型图文笔记</option>
+                      </select>
+                      <span className="settings-input-caption">纯文本不抽帧；理解型图文会调用 VLM 解析图片内容。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("visual_evidence_enabled") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">自动生成图文笔记</span>
+                      <select className="settings-select-field" value={form.visual_evidence_enabled ? "true" : "false"} disabled={(form.visual_note_mode || "text") === "text"} onChange={(e) => updateForm({ ...form, visual_evidence_enabled: e.target.value === "true" })}>
+                        <option value="false">关闭</option>
+                        <option value="true">开启</option>
+                      </select>
+                      <span className="settings-input-caption">摘要完成后在独立队列生成图文版。</span>
+                    </label>
+                    <label className="settings-input-group">
+                      <span className="settings-input-label">多模态理解</span>
+                      <select className="settings-select-field" value={form.visual_multimodal_enabled ? "true" : "false"} disabled={(form.visual_note_mode || "text") !== "vlm_integrated"} onChange={(e) => updateForm({ ...form, visual_multimodal_enabled: e.target.value === "true", visual_evidence_use_llm: e.target.value === "true" })}>
+                        <option value="false">关闭，仅按文本语义插图</option>
+                        <option value="true">开启，调用 VLM 理解画面</option>
+                      </select>
+                      <span className="settings-input-caption">开启后会把压缩识别图送入视觉模型。</span>
+                    </label>
+                  </div>
+                </section>
+
+                {(form.visual_note_mode || "text") !== "text" ? (
+                  <section className="settings-tree-panel">
+                    <header className="settings-tree-panel-header">
+                      <span className="settings-tree-index">04</span>
+                      <div>
+                        <h3>图文截图</h3>
+                        <p>只影响图文笔记抽帧和图片质量，不影响文本总结。</p>
+                      </div>
+                    </header>
+                    <div className="settings-tree-grid">
+                      <label className="settings-input-group" ref={registerFocusTarget("visual_download_resolution") as (node: HTMLLabelElement | null) => void}>
+                        <span className="settings-input-label">下载分辨率</span>
+                        <select className="settings-select-field" value={form.visual_download_resolution || "720p"} onChange={(e) => updateForm({ ...form, visual_download_resolution: e.target.value })}>
+                          <option value="auto">自动</option>
+                          <option value="360p">360p</option>
+                          <option value="480p">480p</option>
+                          <option value="720p">720p</option>
+                        </select>
+                        <span className="settings-input-caption">只影响图文笔记抽帧视频。</span>
+                      </label>
+                      <label className="settings-input-group">
+                        <span className="settings-input-label">最多截图数</span>
+                        <input className="settings-input-field" type="number" min={1} max={30} value={form.visual_evidence_max_frames} onChange={(e) => updateForm({ ...form, visual_evidence_max_frames: parseMinOneInt(e.target.value, 12) })} />
+                        <span className="settings-input-caption">后端限制在 1-30 张。</span>
+                      </label>
+                      <label className="settings-input-group">
+                        <span className="settings-input-label">截图最小间隔（秒）</span>
+                        <input className="settings-input-field" type="number" min={10} value={form.visual_evidence_frame_interval_seconds} onChange={(e) => updateForm({ ...form, visual_evidence_frame_interval_seconds: parseMinOneInt(e.target.value, 10) })} />
+                      </label>
+                      <label className="settings-input-group">
+                        <span className="settings-input-label">笔记图片宽度</span>
+                        <input className="settings-input-field" type="number" min={320} max={1600} value={form.visual_evidence_frame_width} onChange={(e) => updateForm({ ...form, visual_evidence_frame_width: parseMinOneInt(e.target.value, 960) })} />
+                        <span className="settings-input-caption">控制最终图文笔记中的截图宽度上限。</span>
+                      </label>
+                      <label className="settings-input-group">
+                        <span className="settings-input-label">识别图质量</span>
+                        <input className="settings-input-field" type="number" min={1} max={100} value={form.visual_evidence_image_quality} onChange={(e) => updateForm({ ...form, visual_evidence_image_quality: parseMinOneInt(e.target.value, 85) })} />
+                        <span className="settings-input-caption">仅用于 VLM 识别压缩图。</span>
+                      </label>
+                    </div>
+                  </section>
+                ) : null}
+
+                <section className="settings-tree-panel">
+                  <header className="settings-tree-panel-header">
+                    <span className="settings-tree-index">{(form.visual_note_mode || "text") !== "text" ? "05" : "04"}</span>
+                    <div>
+                      <h3>长视频切块</h3>
+                      <p>控制长视频拆分摘要的连续性和单块长度。</p>
+                    </div>
+                  </header>
+                  <div className="settings-tree-grid">
+                    <label className="settings-input-group" ref={registerFocusTarget("summary_chunk_target_chars") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">分块目标字符数</span>
+                      <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_target_chars} onChange={(e) => updateForm({ ...form, summary_chunk_target_chars: parseMinOneInt(e.target.value, 2200) })} />
+                      <span className="settings-input-caption">LLM 处理时分块的目标字符数。</span>
+                    </label>
+                    <label className="settings-input-group" ref={registerFocusTarget("summary_chunk_overlap_segments") as (node: HTMLLabelElement | null) => void}>
+                      <span className="settings-input-label">分块重叠段数</span>
+                      <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_overlap_segments} onChange={(e) => updateForm({ ...form, summary_chunk_overlap_segments: parseMinOneInt(e.target.value, 2) })} />
+                      <span className="settings-input-caption">分块之间保留的重叠段落。</span>
+                    </label>
+                    <div className="settings-inline-alert info">
+                      <strong>分块并发在性能页调整</strong>
+                      <span>如果需要控制单个任务内部同时请求的摘要块数量，请前往“性能与资源”。</span>
+                    </div>
+                  </div>
+                </section>
               </div>
             </section>
           )}
@@ -1458,10 +2881,10 @@ export function SettingsPage({
             <section className="settings-category-section">
               <header className="settings-category-header">
                 <h2>知识库</h2>
-                <p>知识库默认关闭，依赖按需安装到当前运行时，不进入默认安装包。</p>
+                <p>知识库默认关闭，依赖按需安装到当前运行环境，不进入默认安装包。</p>
               </header>
               <div className="settings-form-group">
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("knowledge_enabled") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">启用知识库</span>
                   <select
                     className="settings-select-field"
@@ -1480,12 +2903,12 @@ export function SettingsPage({
                   <strong>{knowledgeDepsReady ? "知识库依赖已就绪" : "知识库依赖未安装"}</strong>
                   <span>
                     {knowledgeDepsReady
-                      ? `chromadb${environment?.chromadbVersion ? ` ${environment.chromadbVersion}` : ""} 与 sentence-transformers${environment?.sentenceTransformersVersion ? ` ${environment.sentenceTransformersVersion}` : ""} 已在当前运行时可用。`
+                      ? `chromadb${environment?.chromadbVersion ? ` ${environment.chromadbVersion}` : ""} 与 sentence-transformers${environment?.sentenceTransformersVersion ? ` ${environment.sentenceTransformersVersion}` : ""} 已在当前运行环境可用。`
                       : `默认安装包不包含知识库重依赖。将使用 ${pipIndexSummary} 源依次尝试安装 ${missingKnowledgeDeps.join("、") || "chromadb 与 sentence-transformers"}。`}
                   </span>
                 </div>
                 <div className="settings-input-group">
-                  <span className="settings-input-label">知识库运行时依赖</span>
+                  <span className="settings-input-label">知识库运行环境依赖</span>
                   <div
                     className={`settings-actions settings-focus-target ${activeFocusTarget === "knowledge_dependencies" ? "is-highlighted" : ""}`}
                     ref={registerFocusTarget("knowledge_dependencies") as (node: HTMLDivElement | null) => void}
@@ -1494,12 +2917,12 @@ export function SettingsPage({
                       {knowledgeDepsInstalling ? "安装中..." : knowledgeDepsReady ? "重新安装知识库依赖" : "安装知识库依赖"}
                     </button>
                     <button
-                      className="ghost-button"
+                      className="secondary-button"
                       type="button"
                       disabled={runtimeStatusLoading}
                       onClick={() => void refreshRuntimeStatus()}
                     >
-                      {runtimeStatusLoading ? "检查中..." : "检查运行时"}
+                      {runtimeStatusLoading ? "检查中..." : "检查运行环境"}
                     </button>
                   </div>
                   <span className="settings-input-caption">
@@ -1562,10 +2985,27 @@ export function SettingsPage({
                     {form.knowledge_llm_enabled ? (
                       <>
                         <label
+                          className={`settings-input-group settings-focus-target ${activeFocusTarget === "knowledge_llm_provider" ? "is-highlighted" : ""}`}
+                          ref={registerFocusTarget("knowledge_llm_provider") as (node: HTMLLabelElement | null) => void}
+                        >
+                          <span className="settings-input-label">LLM 提供商</span>
+                          <select
+                            className="settings-select-field"
+                            value={form.knowledge_llm_provider || "openai-compatible"}
+                            disabled={!form.knowledge_enabled}
+                            onChange={(e) => updateForm({ ...form, knowledge_llm_provider: e.target.value })}
+                          >
+                            <option value="openai-compatible">OpenAI Compatible</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic</option>
+                            <option value="custom">自建端点</option>
+                          </select>
+                        </label>
+                        <label
                           className={`settings-input-group settings-focus-target ${activeFocusTarget === "knowledge_llm_base_url" ? "is-highlighted" : ""}`}
                           ref={registerFocusTarget("knowledge_llm_base_url") as (node: HTMLLabelElement | null) => void}
                         >
-                          <span className="settings-input-label">知识库 API Base URL</span>
+                          <span className="settings-input-label">API Base URL</span>
                           <input
                             className="settings-input-field"
                             value={form.knowledge_llm_base_url}
@@ -1573,39 +3013,43 @@ export function SettingsPage({
                             onChange={(e) => updateForm({ ...form, knowledge_llm_base_url: e.target.value })}
                             placeholder="https://api.openai.com/v1"
                           />
+                          <span className="settings-input-caption">知识库问答与自动打标 LLM API 的基础 URL 地址。</span>
                         </label>
                         <label
                           className={`settings-input-group settings-focus-target ${activeFocusTarget === "knowledge_llm_api_key" ? "is-highlighted" : ""}`}
                           ref={registerFocusTarget("knowledge_llm_api_key") as (node: HTMLLabelElement | null) => void}
                         >
-                          <span className="settings-input-label">知识库 API Key</span>
+                          <span className="settings-input-label">API Key</span>
                           <input
                             className="settings-input-field"
                             type="password"
                             value={form.knowledge_llm_api_key}
                             disabled={!form.knowledge_enabled}
+                            onFocus={selectMaskedApiKey}
                             onChange={(e) => updateForm({ ...form, knowledge_llm_api_key: e.target.value })}
                             placeholder="sk-..."
                           />
+                          <span className="settings-input-caption">知识库 LLM 服务的 API 密钥。</span>
                         </label>
                         <label
                           className={`settings-input-group settings-focus-target ${activeFocusTarget === "knowledge_llm_model" ? "is-highlighted" : ""}`}
                           ref={registerFocusTarget("knowledge_llm_model") as (node: HTMLLabelElement | null) => void}
                         >
-                          <span className="settings-input-label">知识库模型名称</span>
+                          <span className="settings-input-label">模型名称</span>
                           <input
                             className="settings-input-field"
                             value={form.knowledge_llm_model}
                             disabled={!form.knowledge_enabled}
                             onChange={(e) => updateForm({ ...form, knowledge_llm_model: e.target.value })}
-                            placeholder="gpt-4o-mini / qwen-plus"
+                            placeholder="gpt-4o-mini / claude-3-haiku"
                           />
+                          <span className="settings-input-caption">要用于知识库问答和自动打标的 LLM 模型名称。</span>
                         </label>
                         <div className="settings-inline-actions">
                           <button className="secondary-button" type="button" disabled={llmTestBusy || !form.knowledge_enabled} onClick={() => void testKnowledgeLlmConnection()}>
                             {llmTestBusy ? "测试中..." : "测试知识库 LLM"}
                           </button>
-                          <span className="settings-input-caption">使用当前独立知识库配置发起一次临时测试，不会保存设置。</span>
+                          <span className="settings-input-caption">使用当前表单中的 Base URL、API Key 和模型名临时请求一次，并校验是否能返回合法 JSON，不会保存设置。</span>
                         </div>
                       </>
                     ) : null}
@@ -1613,51 +3057,334 @@ export function SettingsPage({
                 ) : (
                   <div className={`settings-inline-alert ${knowledgeLlmReady ? "success" : "warning"}`}>
                     <strong>{knowledgeLlmReady ? "知识库当前跟随主 LLM" : "知识库当前跟随主 LLM，但主 LLM 还未补全"}</strong>
-                    <span>{knowledgeLlmReady ? "自动打标和问答会直接复用主 LLM 配置。" : "请先启用主 LLM，并补全 Base URL 与模型名，或切换为独立配置。"}</span>
+                    <span>{knowledgeLlmReady ? "自动打标和问答会直接复用主 LLM 配置。" : "请先启用主 LLM，并补全 API Key、Base URL 与模型名，或切换为独立配置。"}</span>
                   </div>
                 )}
               </div>
             </section>
           )}
 
-          {activeCategory === "summary" && (
-            <section className="settings-category-section">
+          {activeCategory === "prompts" && (
+            <section className="settings-category-section settings-prompts-section">
               <header className="settings-category-header">
-                <h2>摘要参数</h2>
-                <p>摘要生成算法参数配置。</p>
+                <h2>提示词</h2>
+                <p>这里属于高级个性化区域。想改变知识笔记风格时再调整，日常使用保持默认即可。</p>
               </header>
-              <div className="settings-form-group">
-                <label className="settings-input-group">
-                  <span className="settings-input-label">摘要模式</span>
-                  <select className="settings-select-field" value={form.summary_mode} onChange={(e) => updateForm({ ...form, summary_mode: e.target.value })}>
-                    <option value="llm">LLM 智能摘要</option>
-                    <option value="extract">抽取式摘要</option>
-                  </select>
-                </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">语言</span>
-                  <select className="settings-select-field" value={form.language} onChange={(e) => updateForm({ ...form, language: e.target.value })}>
-                    <option value="zh">中文</option>
-                    <option value="en">English</option>
-                    <option value="ja">日本語</option>
-                  </select>
-                </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">分块目标字符数</span>
-                  <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_target_chars} onChange={(e) => updateForm({ ...form, summary_chunk_target_chars: parseMinOneInt(e.target.value, 2200) })} />
-                  <span className="settings-input-caption">LLM 处理时分块的目标字符数</span>
-                </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">分块重叠段数</span>
-                  <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_overlap_segments} onChange={(e) => updateForm({ ...form, summary_chunk_overlap_segments: parseMinOneInt(e.target.value, 2) })} />
-                  <span className="settings-input-caption">分块之间的重叠段数，保证连续性</span>
-                </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">重试次数</span>
-                  <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_retry_count} onChange={(e) => updateForm({ ...form, summary_chunk_retry_count: parseMinOneInt(e.target.value, 2) })} />
-                  <span className="settings-input-caption">API 调用失败时的重试次数</span>
-                </label>
+              <div className="settings-prompt-scope-alert">
+                <span className="settings-prompt-scope-kicker">生效范围</span>
+                <p>首页选择的 Prompt 预设只影响摘要生成；知识笔记和图文笔记使用下方全局模板。恢复默认或修改模板后，需要点击左侧“保存设置”才会生效。</p>
               </div>
+              {hasOuterSectionsOpen && (
+                <div className="settings-prompt-global-sticky">
+                  <span className="settings-prompt-toolbar-title">已展开 {outerSectionsOpen.size} 项</span>
+                  <button className="settings-prompt-inline-action" type="button" onClick={(e) => { e.preventDefault(); collapseAllOuter(); }}>收起全部</button>
+                </div>
+              )}
+              <div className="settings-prompt-list">
+                <details className="settings-prompt-collapse" ref={(node) => { promptDetailsRefs.current.summary = node; }} onToggle={(e) => handleOuterToggle("summary", e)}>
+                  <summary className="settings-prompt-collapse-summary">
+                    <span className="settings-prompt-summary-copy">
+                      <span className="settings-prompt-summary-title">摘要 Prompt</span>
+                      <span className="settings-prompt-summary-desc">控制视频摘要的角色、结构和输出格式。</span>
+                    </span>
+                    <span className="settings-prompt-summary-meta">
+                      <span className="settings-prompt-chip accent">核心</span>
+                      <span className="settings-prompt-open-label">展开</span>
+                    </span>
+                  </summary>
+                  <div className="settings-form-group">
+                  <label className="settings-input-group" ref={registerFocusTarget("summary_system_prompt") as (node: HTMLLabelElement | null) => void}>
+                    <span className="settings-input-label">摘要 System Prompt</span>
+                    <textarea
+                      className="textarea-field"
+                      rows={5}
+                      value={form.summary_system_prompt || ""}
+                      onChange={(e) => updateForm({ ...form, summary_system_prompt: e.target.value })}
+                    />
+                    <div className="settings-inline-actions">
+                      <button className="secondary-button" type="button" onClick={() => resetSummaryPrompt("system")}>
+                        恢复默认
+                      </button>
+                      {undoPromptValues?.summary_system_prompt !== undefined && (
+                        <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                      )}
+                      <span className="settings-input-caption">控制视频摘要生成时的角色、风格和整体约束。</span>
+                    </div>
+                  </label>
+                  <label className="settings-input-group" ref={registerFocusTarget("summary_user_prompt_template") as (node: HTMLLabelElement | null) => void}>
+                    <span className="settings-input-label">摘要 User Template</span>
+                    <textarea
+                      className="textarea-field"
+                      rows={14}
+                      value={form.summary_user_prompt_template || ""}
+                      onChange={(e) => updateForm({ ...form, summary_user_prompt_template: e.target.value })}
+                    />
+                    <div className="settings-inline-actions">
+                      <button className="secondary-button" type="button" onClick={() => resetSummaryPrompt("template")}>
+                        恢复默认
+                      </button>
+                      {undoPromptValues?.summary_user_prompt_template !== undefined && (
+                        <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                      )}
+                      <span className="settings-input-caption">
+                        可用变量：{"{title}"}、{"{transcript}"}、{"{segments_json}"}。生成 JSON 包含 title/overview/bulletPoints/chapters/chapterGroups。
+                      </span>
+                    </div>
+                  </label>
+                  </div>
+                </details>
+
+                {/* Custom collapse for presets section (no native <details> — breaks position:sticky) */}
+                <div className={`settings-prompt-collapse settings-focus-target ${presetsSectionOpen ? " open" : ""}`} ref={registerFocusTarget("prompt_presets_library") as (node: HTMLDivElement | null) => void}>
+                  <div
+                    className="settings-prompt-collapse-summary"
+                    role="button"
+                    tabIndex={0}
+                    aria-expanded={presetsSectionOpen}
+                    onClick={handlePresetsSectionToggle}
+                    onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handlePresetsSectionToggle(); }}}
+                  >
+                    <span className="settings-prompt-summary-copy">
+                      <span className="settings-prompt-summary-title">Prompt 预设库</span>
+                      <span className="settings-prompt-summary-desc">管理首页摘要 Prompt 下拉框和自动推荐候选。</span>
+                    </span>
+                    <span className="settings-prompt-summary-meta">
+                      <span className="settings-prompt-chip">内置 {builtinPresetCount}</span>
+                      <span className="settings-prompt-chip muted">隐藏 {hiddenBuiltinPresetCount}</span>
+                      <span className="settings-prompt-chip success">新增 {customPresetCount}</span>
+                      <span className="settings-prompt-open-label">展开</span>
+                    </span>
+                  </div>
+                  {presetsSectionOpen && (
+                    <div className="settings-form-group" style={{ position: "relative" }}>
+                    <div className="settings-preset-section-note">
+                      <strong>摘要预设</strong>
+                      <span>用于首页 Prompt 下拉框和自动推荐，只替换摘要 System Prompt / User Template。内置预设可查看或隐藏，新增预设可编辑或删除。</span>
+                    </div>
+                    {hiddenBuiltinPresets.length ? (
+                      <div className="settings-hidden-preset-list">
+                        <span className="settings-input-caption">已隐藏内置预设</span>
+                        <div className="settings-hidden-preset-actions">
+                          {hiddenBuiltinPresets.map((preset) => (
+                            <button className="secondary-button" type="button" key={preset.id} onClick={() => setBuiltinPresetHidden(preset.id, false)}>
+                              恢复 {preset.name}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+                    {promptPresetsLoading ? (
+                      <span className="settings-input-caption">加载中...</span>
+                    ) : promptPresets.length === 0 ? (
+                      <span className="settings-input-caption">暂无预设</span>
+                    ) : (
+                      <>
+                        {visiblePresets.map(renderPresetCard)}
+                      </>
+                    )}
+                    {showNewPresetForm && (
+                      <div className="settings-preset-card new">
+                        <div className="settings-preset-edit-body">
+                          <h4>新建预设</h4>
+                          <label className="settings-input-group settings-preset-field">
+                            <span className="settings-input-label">名称 *</span>
+                            <input className="settings-input-field" value={presetForm.name} onChange={(e) => setPresetForm({ ...presetForm, name: e.target.value })} placeholder="预设名称（用作 ID）" />
+                          </label>
+                          <label className="settings-input-group settings-preset-field">
+                            <span className="settings-input-label">描述</span>
+                            <input className="settings-input-field" value={presetForm.description || ""} onChange={(e) => setPresetForm({ ...presetForm, description: e.target.value })} />
+                          </label>
+                          <label className="settings-input-group settings-preset-field">
+                            <span className="settings-input-label">分类</span>
+                            <input className="settings-input-field" value={presetForm.category || ""} onChange={(e) => setPresetForm({ ...presetForm, category: e.target.value })} placeholder="例如: 教程、会议、娱乐" />
+                          </label>
+                          <label className="settings-input-group settings-preset-field">
+                            <span className="settings-input-label">自动匹配关键词（逗号分隔）</span>
+                            <input className="settings-input-field" value={presetForm.auto_match_keywords?.join("、") || ""} onChange={(e) => setPresetForm({ ...presetForm, auto_match_keywords: e.target.value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean) })} placeholder="例如: 教程、教学、入门" />
+                          </label>
+                          <label className="settings-input-group settings-preset-field">
+                            <span className="settings-input-label">System Prompt *</span>
+                            <textarea className="textarea-field" rows={4} value={presetForm.system_prompt} onChange={(e) => setPresetForm({ ...presetForm, system_prompt: e.target.value })} />
+                          </label>
+                          <label className="settings-input-group settings-preset-field">
+                            <span className="settings-input-label">User Template *</span>
+                            <textarea className="textarea-field" rows={10} value={presetForm.user_prompt_template} onChange={(e) => setPresetForm({ ...presetForm, user_prompt_template: e.target.value })} />
+                          </label>
+                          <div className="settings-preset-actions">
+                            <button className="primary-button" type="button" disabled={presetSaveBusy} onClick={savePreset}>
+                              {presetSaveBusy ? "创建中..." : "创建预设"}
+                            </button>
+                            <button className="secondary-button" type="button" onClick={cancelPresetEdit}>取消</button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    {presetStatus && <p className="settings-input-caption" style={{ marginTop: 8, color: presetStatus.includes("失败") ? "var(--danger)" : "var(--success)" }}>{presetStatus}</p>}
+                    {!showNewPresetForm && !promptPresetsLoading && (
+                      <button className="secondary-button" type="button" onClick={startNewPreset} style={{ marginTop: 12 }}>
+                        + 新建预设
+                      </button>
+                    )}
+                    </div>
+                  )}
+                </div>
+
+                <details className="settings-prompt-collapse" ref={(node) => { promptDetailsRefs.current.knowledge = node; }} onToggle={(e) => handleOuterToggle("knowledge", e)}>
+                  <summary className="settings-prompt-collapse-summary">
+                    <span className="settings-prompt-summary-copy">
+                      <span className="settings-prompt-summary-title">知识笔记 Prompt</span>
+                      <span className="settings-prompt-summary-desc">控制知识笔记的整理风格、Markdown 结构和变量使用。</span>
+                    </span>
+                    <span className="settings-prompt-summary-meta">
+                      <span className="settings-prompt-chip">全局模板</span>
+                      <span className="settings-prompt-open-label">展开</span>
+                    </span>
+                  </summary>
+                  <div className="settings-form-group">
+                  <label className="settings-input-group" ref={registerFocusTarget("knowledge_note_system_prompt") as (node: HTMLLabelElement | null) => void}>
+                    <span className="settings-input-label">知识笔记 System Prompt</span>
+                    <textarea
+                      className="textarea-field"
+                      rows={5}
+                      value={form.knowledge_note_system_prompt || ""}
+                      onChange={(e) => updateForm({ ...form, knowledge_note_system_prompt: e.target.value })}
+                    />
+                    <div className="settings-inline-actions">
+                      <button className="secondary-button" type="button" onClick={() => resetKnowledgeNotePrompt("system")}>
+                        恢复默认
+                      </button>
+                      {undoPromptValues?.knowledge_note_system_prompt !== undefined && (
+                        <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                      )}
+                      <span className="settings-input-caption">控制知识笔记生成时的角色、风格和整体约束。</span>
+                    </div>
+                  </label>
+                  <label className="settings-input-group" ref={registerFocusTarget("knowledge_note_user_prompt_template") as (node: HTMLLabelElement | null) => void}>
+                    <span className="settings-input-label">知识笔记 User Template</span>
+                    <textarea
+                      className="textarea-field"
+                      rows={14}
+                      value={form.knowledge_note_user_prompt_template || ""}
+                      onChange={(e) => updateForm({ ...form, knowledge_note_user_prompt_template: e.target.value })}
+                    />
+                    <div className="settings-inline-actions">
+                      <button className="secondary-button" type="button" onClick={() => resetKnowledgeNotePrompt("template")}>
+                        恢复默认
+                      </button>
+                      {undoPromptValues?.knowledge_note_user_prompt_template !== undefined && (
+                        <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                      )}
+                      <span className="settings-input-caption">
+                        可用变量：{"{title}"}、{"{transcript_excerpt}"}、{"{segments_excerpt}"}、{"{summary_json}"}。
+                      </span>
+                    </div>
+                  </label>
+                  <div className="settings-guide-card">
+                    <div>
+                      <strong>想调整知识笔记样式？</strong>
+                      <span>查看变量、默认结构和常见改法，避免破坏 JSON 输出格式。</span>
+                    </div>
+                    <button className="secondary-button" type="button" onClick={() => setKnowledgePromptGuideOpen(true)}>
+                      打开教程
+                    </button>
+                  </div>
+                  </div>
+                </details>
+
+                <details className="settings-prompt-collapse" ref={(node) => { promptDetailsRefs.current.visual = node; }} onToggle={(e) => handleOuterToggle("visual", e)}>
+                  <summary className="settings-prompt-collapse-summary">
+                    <span className="settings-prompt-summary-copy">
+                      <span className="settings-prompt-summary-title">图文笔记 Prompt</span>
+                      <span className="settings-prompt-summary-desc">控制关键帧选择、画面理解和图文笔记整合。</span>
+                    </span>
+                    <span className="settings-prompt-summary-meta">
+                      <span className="settings-prompt-chip info">VLM</span>
+                      <span className="settings-prompt-open-label">展开</span>
+                    </span>
+                  </summary>
+                  <div className="settings-form-group">
+                  <label className="settings-input-group" ref={registerFocusTarget("visual_note_system_prompt") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">图文笔记 System Prompt</span>
+                  <textarea
+                    className="textarea-field"
+                    rows={5}
+                    value={form.visual_note_system_prompt || ""}
+                    onChange={(e) => updateForm({ ...form, visual_note_system_prompt: e.target.value })}
+                  />
+                  <div className="settings-inline-actions">
+                    <button className="secondary-button" type="button" onClick={() => resetVisualNotePrompt("system")}>
+                      恢复默认
+                    </button>
+                    {undoPromptValues?.visual_note_system_prompt !== undefined && (
+                      <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                    )}
+                    <span className="settings-input-caption">控制理解型图文笔记如何把图片解析整合进正文。</span>
+                  </div>
+                </label>
+                <label className="settings-input-group" ref={registerFocusTarget("visual_frame_planning_prompt") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">捕获帧规划 Prompt</span>
+                  <textarea
+                    className="textarea-field"
+                    rows={10}
+                    value={form.visual_frame_planning_prompt || ""}
+                    onChange={(e) => updateForm({ ...form, visual_frame_planning_prompt: e.target.value })}
+                  />
+                  <div className="settings-inline-actions">
+                    <button className="secondary-button" type="button" onClick={() => resetVisualNotePrompt("planning")}>
+                      恢复默认
+                    </button>
+                    {undoPromptValues?.visual_frame_planning_prompt !== undefined && (
+                      <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                    )}
+                    <span className="settings-input-caption">
+                      可用变量：{"{title}"}、{"{mode}"}、{"{summary_json}"}、{"{knowledge_note_markdown}"}、{"{segments_excerpt}"}、{"{max_frames}"}。
+                    </span>
+                  </div>
+                </label>
+                <label className="settings-input-group" ref={registerFocusTarget("visual_vlm_prompt") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">画面理解 Prompt</span>
+                  <textarea
+                    className="textarea-field"
+                    rows={10}
+                    value={form.visual_vlm_prompt || ""}
+                    onChange={(e) => updateForm({ ...form, visual_vlm_prompt: e.target.value })}
+                  />
+                  <div className="settings-inline-actions">
+                    <button className="secondary-button" type="button" onClick={() => resetVisualNotePrompt("vlm")}>
+                      恢复默认
+                    </button>
+                    {undoPromptValues?.visual_vlm_prompt !== undefined && (
+                      <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                    )}
+                    <span className="settings-input-caption">
+                      可用变量：{"{title}"}、{"{timestamp}"}、{"{context}"}、{"{timeline_hint}"}、{"{knowledge_note_markdown}"}。
+                    </span>
+                  </div>
+                </label>
+                <label className="settings-input-group" ref={registerFocusTarget("visual_note_user_prompt_template") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">图文笔记 User Template</span>
+                  <textarea
+                    className="textarea-field"
+                    rows={12}
+                    value={form.visual_note_user_prompt_template || ""}
+                    onChange={(e) => updateForm({ ...form, visual_note_user_prompt_template: e.target.value })}
+                  />
+                  <div className="settings-inline-actions">
+                    <button className="secondary-button" type="button" onClick={() => resetVisualNotePrompt("template")}>
+                      恢复默认
+                    </button>
+                    {undoPromptValues?.visual_note_user_prompt_template !== undefined && (
+                      <button className="secondary-button" type="button" onClick={undoPromptReset}>回退设置</button>
+                    )}
+                    <span className="settings-input-caption">
+                      可用变量：{"{title}"}、{"{knowledge_note_markdown}"}、{"{visual_observations_json}"}。
+                    </span>
+                  </div>
+                </label>
+                  </div>
+                </details>
+              </div>
+
             </section>
           )}
 
@@ -1668,17 +3395,17 @@ export function SettingsPage({
                 <p>控制任务级并发与单任务内部分块并发，减少本地资源争抢和云端限流压力。</p>
               </header>
               <div className="settings-form-group">
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("task_concurrency") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">任务并发数</span>
                   <input className="settings-input-field" type="number" min={1} value={form.task_concurrency} onChange={(e) => updateForm({ ...form, task_concurrency: parseMinOneInt(e.target.value, recommendedTaskConcurrency) })} />
                   <span className="settings-input-caption">影响下载、转写、摘要的整体链路吞吐；云 API 可能存在并发限流，建议按当前环境推荐值设置。</span>
                 </label>
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("mindmap_concurrency") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">导图并发数</span>
                   <input className="settings-input-field" type="number" min={1} value={form.mindmap_concurrency} onChange={(e) => updateForm({ ...form, mindmap_concurrency: parseMinOneInt(e.target.value, 1) })} />
                   <span className="settings-input-caption">影响摘要完成后的导图生成吞吐，不会占用摘要任务的并发槽位；建议保持 1。</span>
                 </label>
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("summary_chunk_concurrency") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">摘要分块并发数</span>
                   <input className="settings-input-field" type="number" min={1} value={form.summary_chunk_concurrency} onChange={(e) => updateForm({ ...form, summary_chunk_concurrency: parseMinOneInt(e.target.value, 2) })} />
                   <span className="settings-input-caption">仅控制单个摘要任务内部同时请求的分块数量，不等同于任务并发数。</span>
@@ -1702,14 +3429,14 @@ export function SettingsPage({
             </section>
           )}
 
-          {activeCategory === "advanced" && (
+          {activeCategory === "performance" && (
             <section className="settings-category-section">
               <header className="settings-category-header">
-                <h2>高级设置</h2>
-                <p>CUDA 变体和运行时配置。</p>
+                <h2>资源策略</h2>
+                <p>根据机器和任务规模调整 CUDA 版本、运行环境通道和缓存策略。</p>
               </header>
               <div className="settings-form-group">
-                <label className="settings-input-group">
+                <label className="settings-input-group" ref={registerFocusTarget("cuda_variant") as (node: HTMLLabelElement | null) => void}>
                   <span className="settings-input-label">CUDA 变体</span>
                   <select className="settings-select-field" value={form.cuda_variant} onChange={(e) => updateForm({ ...form, cuda_variant: e.target.value })}>
                     <option value="cu128">CUDA 12.8</option>
@@ -1718,8 +3445,8 @@ export function SettingsPage({
                   </select>
                   <span className="settings-input-caption">PyTorch CUDA 版本</span>
                 </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">运行时通道</span>
+                <label className="settings-input-group" ref={registerFocusTarget("runtime_channel") as (node: HTMLLabelElement | null) => void}>
+                  <span className="settings-input-label">运行环境通道</span>
                   <select className="settings-select-field" value={form.runtime_channel} onChange={(e) => updateForm({ ...form, runtime_channel: e.target.value })}>
                     <option value="base">基础版</option>
                     <option value="gpu-cu128">GPU CUDA12.8</option>
@@ -1727,44 +3454,17 @@ export function SettingsPage({
                     <option value="gpu-cu124">GPU CUDA12.4</option>
                   </select>
                 </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">保留临时音频</span>
-                  <select className="settings-select-field" value={form.preserve_temp_audio ? "true" : "false"} onChange={(e) => updateForm({ ...form, preserve_temp_audio: e.target.value === "true" })}>
-                    <option value="false">不保留</option>
-                    <option value="true">保留</option>
-                  </select>
-                </label>
-                <label className="settings-input-group">
-                  <span className="settings-input-label">启用缓存</span>
-                  <select className="settings-select-field" value={form.enable_cache ? "true" : "false"} onChange={(e) => updateForm({ ...form, enable_cache: e.target.value === "true" })}>
-                    <option value="true">开启</option>
-                    <option value="false">关闭</option>
-                  </select>
-                </label>
-                <label
-                  className={`settings-input-group settings-focus-target ${activeFocusTarget === "ytdlp_cookies_file" ? "is-highlighted" : ""}`}
-                  ref={registerFocusTarget("ytdlp_cookies_file") as (node: HTMLLabelElement | null) => void}
-                >
-                  <span className="settings-input-label">yt-dlp Cookies 文件</span>
-                  <input
-                    className="settings-input-field"
-                    value={form.ytdlp_cookies_file || ""}
-                    onChange={(e) => updateForm({ ...form, ytdlp_cookies_file: e.target.value })}
-                    placeholder="C:\\Users\\you\\Downloads\\cookies.txt"
-                  />
-                  <span className="settings-input-caption">推荐通过提示弹窗打开 B 站登录窗口自动生成；也可以手动填写从已登录浏览器导出的 B 站 cookies.txt。</span>
-                </label>
               </div>
             </section>
           )}
 
-          {activeCategory === "environment" && (
+          {activeCategory === "runtime" && (
             <section className="settings-category-section">
               <header className="settings-category-header">
                 <h2>运行环境</h2>
                 <p>环境检测信息、CUDA 配置和本地 ASR 安装。</p>
               </header>
-              <div className="env-summary-grid settings-env-grid">
+              <div className="env-summary-grid settings-env-grid" ref={registerFocusTarget("runtime_status") as (node: HTMLDivElement | null) => void}>
                 <div className="metric-card">
                   <span className="metric-label">推荐设备</span>
                   <strong className="metric-value">{environment?.recommendedDevice || "-"}</strong>
@@ -1802,15 +3502,15 @@ export function SettingsPage({
                 <h3 className="settings-cuda-title">CUDA 目标版本</h3>
                 <div className="cuda-insight-grid">
                   <div className="setting-row">
-                    <span className="setting-label">目标运行时</span>
+                    <span className="setting-label">目标运行环境</span>
                     <span className="setting-value">{targetRuntimeChannel}</span>
                   </div>
                   <div className="setting-row">
-                    <span className="setting-label">当前运行时</span>
+                    <span className="setting-label">当前运行环境</span>
                     <span className="setting-value">{environment?.runtimeChannel || form.runtime_channel || "base"}</span>
                   </div>
                   <div className="setting-row">
-                    <span className="setting-label">运行时状态</span>
+                    <span className="setting-label">运行环境状态</span>
                     <span className="setting-value">{environment?.runtimeReady === false ? "未就绪" : "已就绪"}</span>
                   </div>
                 </div>
@@ -1855,22 +3555,22 @@ export function SettingsPage({
                         setCudaInstalling(true);
                         setCudaStartedAt(Date.now());
                         setCudaProgress(8);
-                        setCudaStage("准备 GPU 运行时目录");
-                        setCudaStatus("CUDA 安装已开始，正在准备运行时...");
+                        setCudaStage("准备 GPU 运行环境目录");
+                        setCudaStatus("CUDA 安装已开始，正在准备运行环境...");
                         setCudaOutput("");
-                        setCudaDetail(`将为 ${targetRuntimeChannel} 安装 PyTorch CUDA 依赖，并把运行时切换到该通道。`);
+                        setCudaDetail(`将为 ${targetRuntimeChannel} 安装 PyTorch CUDA 依赖，并把运行环境切换到该通道。`);
                         const result = await api.installCuda({ cuda_variant: form.cuda_variant });
                         const nextRuntimeChannel = result.runtimeChannel || form.runtime_channel;
                         setCudaInstalling(false);
                         setCudaProgress(100);
-                        setCudaStage(result.restartRequired ? "CUDA 安装完成，等待重启切换运行时" : "CUDA 安装完成");
+                        setCudaStage(result.restartRequired ? "CUDA 安装完成，等待重启切换运行环境" : "CUDA 安装完成");
                         setCudaStatus(
                           result.restartRequired
-                            ? "CUDA 安装完成，请重启应用后切换到新的 GPU 运行时"
+                            ? "CUDA 安装完成，请重启应用后切换到新的 GPU 运行环境"
                             : "CUDA 安装命令已执行"
                         );
                         setCudaOutput(result.stdoutTail || "");
-                        setCudaDetail(`安装目标：${result.cudaVariant || form.cuda_variant}，运行时通道：${nextRuntimeChannel}。`);
+                        setCudaDetail(`安装目标：${result.cudaVariant || form.cuda_variant}，运行环境通道：${nextRuntimeChannel}。`);
                         setForm({ ...form, runtime_channel: nextRuntimeChannel, cuda_variant: result.cudaVariant || form.cuda_variant });
                         setIsDirty(false);
                         setEnvironment(await api.getEnvironment({ runtimeChannel: nextRuntimeChannel, refresh: true }));
@@ -1889,10 +3589,10 @@ export function SettingsPage({
                 </div>
               </div>
               <div className="settings-cuda-section">
-                <h3 className="settings-cuda-title">运行时更新检查</h3>
+                <h3 className="settings-cuda-title">运行环境更新检查</h3>
                 <div className="settings-runtime-toolbar">
                   <span className={`settings-inline-alert ${outdatedRuntimeChannels.length > 0 ? "warning" : "success"}`}>
-                    <strong>{outdatedRuntimeChannels.length > 0 ? "有运行时需要同步" : "运行时基础版本一致"}</strong>
+                    <strong>{outdatedRuntimeChannels.length > 0 ? "有运行环境需要同步" : "运行环境基础版本一致"}</strong>
                     <span>
                       {outdatedRuntimeChannels.length > 0
                         ? `${outdatedRuntimeChannels.map((channel) => channel.runtimeChannel).join("、")} 需要同步基础文件；同步会保留 CUDA / ASR / 知识库扩展包。`
@@ -1936,7 +3636,7 @@ export function SettingsPage({
               </div>
               <div className="settings-form-group">
                 <div className="settings-input-group">
-                  <span className="settings-input-label">本地 ASR 运行时</span>
+                  <span className="settings-input-label">本地 ASR 运行环境</span>
                   <div
                     className={`settings-actions settings-focus-target ${activeFocusTarget === "local_asr_runtime" ? "is-highlighted" : ""}`}
                     ref={registerFocusTarget("local_asr_runtime") as (node: HTMLDivElement | null) => void}
@@ -1948,7 +3648,7 @@ export function SettingsPage({
                   <span className="settings-input-caption">
                     {localAsrInstalled
                       ? `当前已安装${environment?.localAsrVersion ? `（${environment.localAsrVersion}）` : ""}，安装后会自动切换到本地模式。`
-                      : "正式安装包默认不包含本地 ASR；安装到当前运行时后会自动切换到本地模式。"}
+                      : "正式安装包默认不包含本地 ASR；安装到当前运行环境后会自动切换到本地模式。"}
                   </span>
                   {localAsrOutput ? (
                     <textarea className="textarea-field log-viewer" rows={8} readOnly value={localAsrOutput}></textarea>
@@ -1985,7 +3685,7 @@ export function SettingsPage({
                     ))}
                   </div>
                   <p className="cuda-helper-text">
-                    安装通常需要几分钟。完成后点击“重新检测”确认 GPU 运行时是否已就绪。
+                    安装通常需要几分钟。完成后点击“重新检测”确认 GPU 运行环境是否已就绪。
                   </p>
                   {cudaDetail ? (
                     <div className={`cuda-status-note ${hasCudaError ? "is-error" : ""}`}>
@@ -2002,7 +3702,7 @@ export function SettingsPage({
               ) : null}
               {environment?.runtimeError ? (
                 <label className="input-row">
-                  <span className="input-label">运行时错误详情</span>
+                  <span className="input-label">运行环境错误详情</span>
                   <textarea className="textarea-field log-viewer" rows={8} readOnly value={environment.runtimeError}></textarea>
                 </label>
               ) : null}
@@ -2010,7 +3710,7 @@ export function SettingsPage({
                 <div className="cuda-next-steps">
                   <strong>下一步</strong>
                   <span>1. 点击"重新检测"确认 GPU runtime 已就绪。</span>
-                  <span>2. 确认"运行时通道"已切换到目标 GPU 通道。</span>
+                  <span>2. 确认"运行环境通道"已切换到目标 GPU 通道。</span>
                   <span>3. 若提示需要重启，请重启应用后再开始转写任务。</span>
                 </div>
               ) : null}
@@ -2023,7 +3723,7 @@ export function SettingsPage({
                 <h2>日志与控制</h2>
                 <p>查看后端日志并控制服务。</p>
               </header>
-              <div className="control-status-row">
+              <div className="control-status-row" ref={registerFocusTarget("service_logs") as (node: HTMLDivElement | null) => void}>
                 <span className={`helper-chip ${serviceOnline ? "status-success" : "status-failed"}`}>{serviceOnline ? "服务在线" : "服务离线"}</span>
                 <span className={`helper-chip ${backendRunning ? (backendReady ? "status-success" : "status-running") : "status-pending"}`}>
                   {backendRunning ? (backendReady ? "内置后端运行中" : "内置后端启动中") : "内置后端未运行"}
@@ -2090,7 +3790,7 @@ export function SettingsPage({
                 <h2>桌面应用更新</h2>
                 <p>{canInstallUpdate ? "检查新版本并管理安装。" : "查看最新版本信息与更新日志。"}</p>
               </header>
-              <div className="settings-update-module">
+              <div className="settings-update-module" ref={registerFocusTarget("app_updates") as (node: HTMLDivElement | null) => void}>
                 <div className="settings-update-overview">
                   <div className="settings-update-copy">
                     <span className="settings-story-kicker">Update</span>
@@ -2211,8 +3911,199 @@ export function SettingsPage({
               </div>
             </section>
           )}
+          <button
+            className="settings-collapse-all-fab"
+            type="button"
+            aria-label="回到顶部"
+            onClick={(e) => { e.preventDefault(); scrollSettingsToTop(); }}
+            title="回到顶部"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15"/><line x1="12" y1="9" x2="12" y2="21"/><line x1="6" y1="3" x2="18" y2="3"/></svg>
+          </button>
         </div>
       </main>
+      {generationModelDialog ? (
+        <div className="update-dialog-overlay" role="presentation" onClick={closeGenerationModelDialog}>
+          <section
+            className="update-dialog generation-model-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="generation-model-dialog-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="update-dialog-header">
+              <div>
+                <span className="settings-model-kicker">模型接入</span>
+                <h2 id="generation-model-dialog-title">{generationModelDialog === "main" ? "主摘要模型" : "视觉理解模型"}</h2>
+              </div>
+              <button className="close-button" type="button" aria-label="关闭模型配置" onClick={closeGenerationModelDialog}>
+                ×
+              </button>
+            </header>
+            <div className="update-dialog-body generation-model-dialog-body">
+              {generationModelDialog === "main" ? (
+                <>
+                  <label className="settings-input-group">
+                    <span className="settings-input-label">LLM 提供商</span>
+                    <select className="settings-select-field" value={form.llm_provider} onChange={(e) => updateForm({ ...form, llm_provider: e.target.value })}>
+                      <option value="openai-compatible">OpenAI Compatible</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="custom">自建端点</option>
+                    </select>
+                  </label>
+                  <label className={`settings-input-group settings-focus-target ${activeFocusTarget === "llm_base_url" ? "is-highlighted" : ""}`}>
+                    <span className="settings-input-label">API Base URL</span>
+                    <input className="settings-input-field" value={form.llm_base_url} onChange={(e) => updateForm({ ...form, llm_base_url: e.target.value })} placeholder="https://api.openai.com/v1" />
+                    <span className="settings-input-caption">主摘要 LLM API 的基础 URL 地址。</span>
+                  </label>
+                  <label className={`settings-input-group settings-focus-target ${activeFocusTarget === "llm_api_key" ? "is-highlighted" : ""}`}>
+                    <span className="settings-input-label">API Key</span>
+                    <input className="settings-input-field" type="password" value={form.llm_api_key} onFocus={selectMaskedApiKey} onChange={(e) => updateForm({ ...form, llm_api_key: e.target.value })} placeholder="sk-..." />
+                    <span className="settings-input-caption">已保存的密钥会用 ****** 显示，直接输入新值即可替换。</span>
+                  </label>
+                  <label className={`settings-input-group settings-focus-target ${activeFocusTarget === "llm_model" ? "is-highlighted" : ""}`}>
+                    <span className="settings-input-label">模型名称</span>
+                    <input className="settings-input-field" value={form.llm_model} onChange={(e) => updateForm({ ...form, llm_model: e.target.value })} placeholder="gpt-4o-mini / claude-3-haiku" />
+                  </label>
+                  <div className={`settings-inline-alert ${llmReady ? "success" : "warning"}`}>
+                    <strong>{llmReady ? "主摘要模型配置完整" : "主摘要模型仍需补全"}</strong>
+                    <span>{llmReady ? "可以保存后用于摘要、导图和默认视觉模型。": "启用 LLM 摘要时，需要 Base URL、API Key 与模型名称都有效。"}</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="settings-inline-alert info">
+                    <strong>默认跟随主 LLM</strong>
+                    <span>视觉字段留空时，会复用主摘要模型的 Base URL、API Key 和模型名称；只有需要单独 VLM 时再填写。</span>
+                  </div>
+                  <label className="settings-input-group">
+                    <span className="settings-input-label">视觉模型提供商</span>
+                    <select className="settings-select-field" value={form.visual_vlm_provider || "openai-compatible"} onChange={(e) => updateForm({ ...form, visual_vlm_provider: e.target.value })}>
+                      <option value="openai-compatible">OpenAI Compatible</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="anthropic">Anthropic</option>
+                      <option value="custom">自建端点</option>
+                    </select>
+                  </label>
+                  <label className="settings-input-group">
+                    <span className="settings-input-label">视觉 API Base URL</span>
+                    <input className="settings-input-field" value={form.visual_evidence_base_url} onChange={(e) => updateForm({ ...form, visual_evidence_base_url: e.target.value })} placeholder="留空则跟随主 LLM Base URL" />
+                  </label>
+                  <label className="settings-input-group">
+                    <span className="settings-input-label">视觉模型名称</span>
+                    <input className="settings-input-field" value={form.visual_evidence_model} onChange={(e) => updateForm({ ...form, visual_evidence_model: e.target.value })} placeholder="留空则跟随主 LLM 模型" />
+                  </label>
+                  <label className="settings-input-group">
+                    <span className="settings-input-label">视觉 API Key</span>
+                    <input className="settings-input-field" type="password" value={form.visual_evidence_api_key} onFocus={selectMaskedApiKey} onChange={(e) => updateForm({ ...form, visual_evidence_api_key: e.target.value })} placeholder="留空则跟随主 LLM API Key" />
+                  </label>
+                  <div className={`settings-inline-alert ${visualLlmReady ? "success" : "warning"}`}>
+                    <strong>{visualLlmReady ? "视觉模型配置完整" : "视觉模型会等待有效模型配置"}</strong>
+                    <span>{visualLlmReady ? "当前有效配置可用于理解型图文笔记。": "请补全独立视觉配置，或确保主摘要模型已完整配置。"}</span>
+                  </div>
+                </>
+              )}
+            </div>
+            <footer className="update-dialog-footer">
+              <button className="secondary-button" type="button" onClick={closeGenerationModelDialog}>
+                关闭
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={llmTestBusy}
+                onClick={() => void (generationModelDialog === "main" ? testLlmConnection() : testVisualLlmConnection())}
+              >
+                {llmTestBusy ? "测试中..." : generationModelDialog === "main" ? "测试主模型" : "测试视觉模型"}
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+      {knowledgePromptGuideOpen ? (
+        <div className="update-dialog-overlay" role="presentation" onClick={() => setKnowledgePromptGuideOpen(false)}>
+          <section
+            className="update-dialog knowledge-prompt-guide-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="knowledge-prompt-guide-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="update-dialog-header">
+              <h2 id="knowledge-prompt-guide-title">知识笔记提示词教程</h2>
+              <button className="close-button" type="button" aria-label="关闭教程" onClick={() => setKnowledgePromptGuideOpen(false)}>
+                ×
+              </button>
+            </header>
+            <div className="update-dialog-body knowledge-prompt-guide-body">
+              <section className="knowledge-prompt-guide-section">
+                <h3>两个输入框分别控制什么</h3>
+                <p>
+                  System Prompt 负责定义角色、底线和总体风格，例如“严谨的中文知识编辑”“不得编造”“只输出 JSON”。
+                  User Template 负责规定笔记结构、可用素材和输出格式，是调整笔记样式的主要位置。
+                </p>
+              </section>
+              <section className="knowledge-prompt-guide-section">
+                <h3>可用变量</h3>
+                <div className="knowledge-prompt-guide-grid">
+                  <span>{"{title}"}</span>
+                  <p>视频标题，适合用于生成笔记标题或判断主题。</p>
+                  <span>{"{summary_json}"}</span>
+                  <p>前一步结构化摘要，包含要点、章节、结论等信息。可以保留，也可以在模板里弱化它的权重。</p>
+                  <span>{"{transcript_excerpt}"}</span>
+                  <p>转写节选，适合补充细节和原文语境。</p>
+                  <span>{"{segments_excerpt}"}</span>
+                  <p>带时间或分段的信息，适合让笔记按章节展开。</p>
+                </div>
+              </section>
+              <section className="knowledge-prompt-guide-section">
+                <h3>默认笔记格式</h3>
+                <p>默认模板倾向生成一篇长阅读型 Markdown 笔记，通常包含：</p>
+                <ul>
+                  <li>核心结论：先给出视频最重要的观点。</li>
+                  <li>关键概念：整理定义、条件、术语和背景。</li>
+                  <li>章节展开：按内容推进顺序补全上下文。</li>
+                  <li>易错点或限制：保留限制、争议、例外和注意事项。</li>
+                </ul>
+              </section>
+              <section className="knowledge-prompt-guide-section">
+                <h3>怎么修改笔记样式</h3>
+                <p>想改格式时，优先改 User Template 里的“写作要求”或“目标结构”。例如：</p>
+                <pre>{`请把 knowledgeNoteMarkdown 写成以下结构：
+# {title}
+
+## 一句话总结
+...
+
+## 关键问题
+- ...
+
+## 可执行清单
+- ...
+
+## 原文中的限制
+- ...`}</pre>
+                <p>
+                  如果想要更短，就写“每个小节不超过 5 条要点”。如果想要课程笔记风格，就写“优先使用定义、例子、推导、复盘题”。
+                </p>
+              </section>
+              <section className="knowledge-prompt-guide-section warning">
+                <h3>不要删掉的约束</h3>
+                <p>
+                  最终仍必须只返回合法 JSON，并且顶层字段必须是 <code>knowledgeNoteMarkdown</code>。
+                  可以改变 Markdown 内容结构，但不要让模型直接输出普通 Markdown，否则任务会解析失败。
+                </p>
+              </section>
+            </div>
+            <footer className="update-dialog-footer">
+              <button className="primary-button" type="button" onClick={() => setKnowledgePromptGuideOpen(false)}>
+                知道了
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
       {taskListOpen ? (
         <div className="settings-tasklist-float" role="dialog" aria-modal="false" aria-label="最近任务列表" onClick={() => setTaskListOpen(false)}>
           <div className="settings-tasklist-panel" onClick={(event) => event.stopPropagation()}>

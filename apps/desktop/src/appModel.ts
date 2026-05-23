@@ -8,6 +8,7 @@ export type Snapshot = {
   settings: ServiceSettings | null;
   videos: VideoAssetSummary[];
   error: string;
+  runtimeInitializing: boolean;
 };
 
 export type DesktopState = {
@@ -53,7 +54,14 @@ export type ConfigHealth = {
   actionText: string;
 };
 
-export const emptySnapshot: Snapshot = { serviceOnline: false, systemInfo: null, environment: null, settings: null, videos: [], error: "" };
+export const emptySnapshot: Snapshot = { serviceOnline: false, systemInfo: null, environment: null, settings: null, videos: [], error: "", runtimeInitializing: false };
+
+const MASKED_API_KEY = "******";
+
+function hasUsableApiKey(value: string | undefined | null, configured: boolean | undefined): boolean {
+  const trimmed = String(value || "").trim();
+  return Boolean(configured || (trimmed && trimmed !== MASKED_API_KEY));
+}
 
 export const devicePreferenceOptions: SelectOption[] = [
   { value: "auto", label: "自动选择" },
@@ -129,9 +137,11 @@ export function getConfigHealth(
   const transcriptionProvider = String(settings.transcription_provider || "").trim().toLowerCase();
   const knowledgeEnabled = Boolean(settings.knowledge_enabled);
   const knowledgeUsesCustomLlm = String(settings.knowledge_llm_mode || "same_as_main").trim().toLowerCase() === "custom";
+  const mainLlmApiKeyReady = hasUsableApiKey(settings.llm_api_key, settings.llm_api_key_configured);
+  const knowledgeLlmApiKeyReady = hasUsableApiKey(settings.knowledge_llm_api_key, settings.knowledge_llm_api_key_configured);
   const knowledgeLlmReady = knowledgeUsesCustomLlm
-    ? Boolean(settings.knowledge_llm_enabled && String(settings.knowledge_llm_base_url || "").trim() && String(settings.knowledge_llm_model || "").trim())
-    : Boolean(settings.llm_enabled && String(settings.llm_base_url || "").trim() && String(settings.llm_model || "").trim());
+    ? Boolean(settings.knowledge_llm_enabled && knowledgeLlmApiKeyReady && String(settings.knowledge_llm_base_url || "").trim() && String(settings.knowledge_llm_model || "").trim())
+    : Boolean(settings.llm_enabled && mainLlmApiKeyReady && String(settings.llm_base_url || "").trim() && String(settings.llm_model || "").trim());
 
   if (transcriptionProvider === "siliconflow" && !settings.siliconflow_asr_api_key_configured) {
     issues.push({
@@ -142,18 +152,39 @@ export function getConfigHealth(
     });
   }
 
+  if (transcriptionProvider === "multimodal") {
+    const multimodalMissingParts: string[] = [];
+    if (!String(settings.multimodal_asr_base_url || "").trim()) {
+      multimodalMissingParts.push("Base URL");
+    }
+    if (!String(settings.multimodal_asr_model || "").trim()) {
+      multimodalMissingParts.push("模型名");
+    }
+    if (!settings.multimodal_asr_api_key_configured) {
+      multimodalMissingParts.push("API Key");
+    }
+    if (multimodalMissingParts.length > 0) {
+      issues.push({
+        key: "multimodal_asr_base_url",
+        title: "多模态 ASR 配置未补全",
+        description: `当前使用多模态 ASR 转写，但以下项目仍为空：${multimodalMissingParts.join("、")}，无法开始视频转写。`,
+        severity: "critical",
+      });
+    }
+  }
+
   if (transcriptionProvider === "local" && environment?.localAsrAvailable === false) {
     issues.push({
       key: "local_asr_runtime",
-      title: "本地 ASR 运行时未就绪",
-      description: "当前使用本地转写，但本地 ASR 尚未安装或当前运行时不可用，请先安装本地 ASR 或切回云端转写。",
+      title: "本地 ASR 运行环境未就绪",
+      description: "当前使用本地转写，但本地 ASR 尚未安装或当前运行环境不可用，请先安装本地 ASR 或切回云端转写。",
       severity: "critical",
     });
   }
 
   const llmMissingParts: string[] = [];
   if (settings.llm_enabled) {
-    if (!settings.llm_api_key_configured) {
+    if (!mainLlmApiKeyReady) {
       llmMissingParts.push("API Key");
     }
     if (!String(settings.llm_base_url || "").trim()) {
@@ -186,7 +217,7 @@ export function getConfigHealth(
     issues.push({
       key: "knowledge_dependencies",
       title: "缺少知识库依赖",
-      description: "当前运行时缺少 chromadb 或 sentence-transformers，无法构建知识库索引。",
+      description: "当前运行环境缺少 chromadb 或 sentence-transformers，无法构建知识库索引。",
       severity: "warning",
     });
   }
@@ -196,8 +227,8 @@ export function getConfigHealth(
       key: "knowledge_llm_configuration",
       title: "知识库 LLM 未补全",
       description: knowledgeUsesCustomLlm
-        ? "知识库当前使用独立 LLM，但还没有补全启用状态、Base URL 或模型名，自动打标和问答暂不可用。"
-        : "知识库当前跟随主 LLM；请先启用主 LLM，并补全 Base URL 与模型名。",
+        ? "知识库当前使用独立 LLM，但还没有补全启用状态、API Key、Base URL 或模型名，自动打标和问答暂不可用。"
+        : "知识库当前跟随主 LLM；请先启用主 LLM，并补全 API Key、Base URL 与模型名。",
       severity: "warning",
     });
   }
@@ -347,6 +378,17 @@ export function stageLabel(stage?: string | null) {
     mindmap_generating: "导图生成中",
     mindmap_completed: "导图完成",
     mindmap_failed: "导图失败",
+    visual_queued: "图文笔记排队",
+    visual_generating: "图文笔记生成中",
+    visual_source_preparing: "准备画面来源",
+    visual_frame_extracting: "抽取关键画面",
+    visual_frame_extracted: "图片索引整理",
+    visual_frame_analyzing: "VLM 解析画面",
+    visual_insert_planning: "规划插图位置",
+    visual_note_composing: "整合图文笔记",
+    visual_completed: "图文笔记完成",
+    visual_partial: "图文笔记降级完成",
+    visual_failed: "图文笔记失败",
     completed: "已完成",
     failed: "失败",
   };
@@ -365,6 +407,8 @@ export function progressEventClass(stage?: string | null) {
   if (stage === "failed") return "error";
   if (stage === "mindmap_completed") return "completed";
   if (stage === "mindmap_failed") return "error";
-  if (stage === "summarizing" || stage === "transcribing" || stage === "downloading" || stage === "mindmap_queued" || stage === "mindmap_llm_request" || stage === "mindmap_generating") return "active";
+  if (stage === "visual_completed" || stage === "visual_partial") return "completed";
+  if (stage === "visual_failed") return "error";
+  if (stage === "summarizing" || stage === "transcribing" || stage === "downloading" || stage === "mindmap_queued" || stage === "mindmap_llm_request" || stage === "mindmap_generating" || stage?.startsWith("visual_")) return "active";
   return "";
 }

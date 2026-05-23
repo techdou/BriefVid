@@ -95,6 +95,87 @@ def test_probe_video_asset_requires_page_selection_for_multi_page(monkeypatch) -
     assert pages[1].source_url == "https://www.bilibili.com/video/BV1xx411c7mD?p=2"
 
 
+def test_probe_video_asset_uses_flat_playlist_thumbnail_for_multi_page_cover(monkeypatch) -> None:
+    payload = {
+        "id": "BV1xx411c7mD",
+        "title": "测试合集",
+        "extractor_key": "BiliBili",
+        "entries": [
+            {"url": "https://www.bilibili.com/video/BV1xx411c7mD?p=1", "title": "P1 开场"},
+            {"url": "https://www.bilibili.com/video/BV1xx411c7mD?p=2", "title": "P2 正片"},
+        ],
+    }
+
+    monkeypatch.setattr(service_app.video_assets, "YoutubeDL", lambda options: _FakeYoutubeDL(payload))
+    monkeypatch.setattr(
+        service_app.video_assets,
+        "fetch_bilibili_page_catalog_payload",
+        lambda url: (
+            [
+                {"page": 1, "part": "开场"},
+                {"page": 2, "part": "正片"},
+            ],
+            "https://example.com/cover.jpg",
+        ),
+    )
+    monkeypatch.setattr(service_app.video_assets, "cache_cover_image", lambda source_url, canonical_id, referer_url=None: f"/media/covers/{canonical_id}.jpg" if source_url else "")
+
+    asset, pages, requires_selection = service_app.probe_video_asset("https://www.bilibili.com/video/BV1xx411c7mD")
+
+    assert requires_selection is True
+    assert asset.cover_url == "/media/covers/BV1xx411c7mD.jpg"
+    assert pages[0].cover_url == "/media/covers/BV1xx411c7mD.jpg"
+    assert pages[1].cover_url == "/media/covers/BV1xx411c7mD.jpg"
+
+
+def test_probe_video_asset_uses_thumbnail_candidates_for_multi_page_cover(monkeypatch) -> None:
+    payload = {
+        "id": "BV1xx411c7mD",
+        "title": "测试合集",
+        "extractor_key": "BiliBili",
+        "thumbnails": [
+            {"url": "https://example.com/small.jpg"},
+            {"url": "https://example.com/large.jpg"},
+        ],
+        "entries": [
+            {
+                "url": "https://www.bilibili.com/video/BV1xx411c7mD?p=1",
+                "title": "P1 开场",
+                "thumbnails": [{"url": "https://example.com/p1-large.jpg"}],
+            },
+            {
+                "url": "https://www.bilibili.com/video/BV1xx411c7mD?p=2",
+                "title": "P2 正片",
+            },
+        ],
+    }
+
+    monkeypatch.setattr(service_app.video_assets, "YoutubeDL", lambda options: _FakeYoutubeDL(payload))
+    monkeypatch.setattr(
+        service_app.video_assets,
+        "fetch_bilibili_page_catalog_payload",
+        lambda url: (
+            [
+                {"page": 1, "part": "开场"},
+                {"page": 2, "part": "正片", "pic": "https://example.com/p2.jpg"},
+            ],
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        service_app.video_assets,
+        "cache_cover_image",
+        lambda source_url, canonical_id, referer_url=None: f"/media/covers/{canonical_id}.jpg" if source_url else "",
+    )
+
+    asset, pages, requires_selection = service_app.probe_video_asset("https://www.bilibili.com/video/BV1xx411c7mD")
+
+    assert requires_selection is True
+    assert asset.cover_url == "/media/covers/BV1xx411c7mD.jpg"
+    assert pages[0].cover_url == "https://example.com/p1-large.jpg"
+    assert pages[1].cover_url == "https://example.com/p2.jpg"
+
+
 def test_probe_video_asset_returns_selected_page_when_page_is_explicit(monkeypatch) -> None:
     payload = {
         "id": "BV1xx411c7mD",
@@ -236,6 +317,108 @@ def test_probe_video_route_preserves_existing_multi_page_cover_on_force_refresh(
     assert response.video.video_id == existing.video_id
     assert response.video.cover_url == "/media/covers/BV1xx411c7mD.jpg"
     assert response.video.pages[0].cover_url == "https://example.com/p1.jpg"
+
+
+def test_probe_video_route_updates_existing_empty_multi_page_cover_on_force_refresh(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    repository = SqliteTaskRepository(connection)
+    repository.initialize()
+    asset = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="BV1xx411c7mD",
+            platform="bilibili",
+            title="测试合集",
+            source_url="https://www.bilibili.com/video/BV1xx411c7mD",
+            cover_url="",
+            pages=[
+                VideoPageOptionResponse(
+                    page=1,
+                    title="P1 开场",
+                    source_url="https://www.bilibili.com/video/BV1xx411c7mD?p=1",
+                    cover_url="",
+                    duration=None,
+                ),
+            ],
+        )
+    )
+
+    monkeypatch.setattr(
+        videos_router,
+        "probe_video_asset",
+        lambda url, force_refresh=False: (
+            VideoAssetRecord(
+                canonical_id="BV1xx411c7mD",
+                platform="bilibili",
+                title="测试合集",
+                source_url="https://www.bilibili.com/video/BV1xx411c7mD",
+                cover_url="/media/covers/BV1xx411c7mD.jpg",
+                pages=[
+                    VideoPageOptionResponse(
+                        page=1,
+                        title="P1 开场",
+                        source_url="https://www.bilibili.com/video/BV1xx411c7mD?p=1",
+                        cover_url="/media/covers/BV1xx411c7mD.jpg",
+                        duration=None,
+                    ),
+                ],
+            ),
+            [],
+            True,
+        ),
+    )
+
+    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {"task_repository": repository})()})()})()
+    response = videos_router.probe_video(
+        videos_router.VideoProbeRequest(url="https://www.bilibili.com/video/BV1xx411c7mD", force_refresh=True),
+        request,
+    )
+    refreshed = repository.get_video_asset(asset.video_id)
+
+    assert response.video.video_id == asset.video_id
+    assert response.video.cover_url == "/media/covers/BV1xx411c7mD.jpg"
+    assert refreshed is not None
+    assert refreshed.cover_url == "/media/covers/BV1xx411c7mD.jpg"
+
+
+def test_list_videos_refreshes_missing_bilibili_cover(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.row_factory = sqlite3.Row
+    repository = SqliteTaskRepository(connection)
+    repository.initialize()
+    asset = repository.upsert_video_asset(
+        VideoAssetRecord(
+            canonical_id="BV1xx411c7mD",
+            platform="bilibili",
+            title="测试合集",
+            source_url="https://www.bilibili.com/video/BV1xx411c7mD",
+            cover_url="",
+        )
+    )
+
+    monkeypatch.setattr(
+        service_app.video_assets,
+        "probe_video_asset",
+        lambda url, force_refresh=False: (
+            VideoAssetRecord(
+                canonical_id="BV1xx411c7mD",
+                platform="bilibili",
+                title="测试合集",
+                source_url="https://www.bilibili.com/video/BV1xx411c7mD",
+                cover_url="/media/covers/BV1xx411c7mD.jpg",
+            ),
+            [],
+            False,
+        ),
+    )
+
+    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {"task_repository": repository})()})()})()
+    response = videos_router.list_videos(request)
+    refreshed = repository.get_video_asset(asset.video_id)
+
+    assert response[0].cover_url == "/media/covers/BV1xx411c7mD.jpg"
+    assert refreshed is not None
+    assert refreshed.cover_url == "/media/covers/BV1xx411c7mD.jpg"
 
 
 def test_probe_video_asset_returns_youtube_single_video(monkeypatch) -> None:
